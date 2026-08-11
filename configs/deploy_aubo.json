@@ -1,0 +1,56 @@
+{
+    "name": "hybridil_aubo",
+    "seed": 1,
+    "source": {
+        "mode": "replay",
+        "hdf5_path": "peel_data/v2.0.hdf5",
+        "demo": "demo_0",
+        "start_index": 0,
+        "max_policy_calls": 1
+    },
+    "inference": {
+        "endpoint": "tcp://127.0.0.1:12345",
+        "timeout_ms": 120000
+    },
+    "policy": {
+        "obs_horizon": 1,
+        "act_horizon": 10,
+        "point_count": 10000,
+        "voxel_size": 0.001,
+        "force_threshold": 6.0,
+        "force_ratio": 0.2
+    },
+    "camera": {
+        "serial": null,
+        "depth_size": [1280, 720],
+        "color_size": [1280, 720],
+        "fps": 30,
+        "timeout_ms": 3000,
+        "warmup_frames": 20
+    },
+    "coordinates": {
+        "calibrated": false
+    },
+    "robot": {
+        "ip": "192.168.100.20",
+        "rpc_port": 30004,
+        "username": "aubo",
+        "password_env": "AUBO_PASSWORD",
+        "request_timeout_ms": 1000,
+        "max_joint_step_rad": 0.0017453292519943296,
+        "allow_motion": false
+    },
+    "force_sensor_config": "configs/xjc_ft.json",
+    "controller_config": "configs/aubo_admit_hybrid.json",
+    "execution": {
+        "control_rate_hz": 125,
+        "action_rate_hz": 30,
+        "control_timeout_s": 0.02,
+        "servo_duration_s": 0.008,
+        "servo_lookahead_s": 0.1,
+        "servo_gain": 200.0,
+        "position_step_m": 0.0001,
+        "rotation_step_rad": 0.001,
+        "workspace_bounds_aubo_base": [[-0.8, 0.8], [-0.8, 0.8], [0.05, 1.2]]
+    }
+}

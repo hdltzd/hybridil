@@ -1,7 +1,7 @@
 {
     "algo_name": "diffusion_policy",
     "experiment": {
-        "name": "dp_ftout",
+        "name": "AnYa",
         "validate": false,
         "logging": {
             "terminal_output_to_txt": true,
@@ -38,7 +38,7 @@
     "train": {
         "data": [
             {
-                "path": "peel_data/peel_skill/zucchini_shave_train.hdf5"
+                "path": "peel_data/AnYa.hdf5"
             }
         ],
         "output_dir": "logs",
@@ -91,7 +91,7 @@
         },
         "goal_mode": null,
         "cuda": true,
-        "batch_size": 32,
+        "batch_size": 128,
         "num_epochs": 1000,
         "seed": 1,
         "data_format": "robomimic"

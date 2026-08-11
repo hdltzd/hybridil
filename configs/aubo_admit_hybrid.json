@@ -1,0 +1,16 @@
+{
+    "control_rate_hz": 125,
+    "mass": [2.0, 2.0, 2.0, 0.1, 0.1, 0.1],
+    "stiffness": [2500.0, 2500.0, 400.0, 5.0, 5.0, 5.0],
+    "damping": [20.0, 20.0, 15.0, 0.1, 0.1, 0.1],
+    "max_acceleration": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+    "max_velocity": [0.01, 0.01, 0.01, 0.05, 0.05, 0.05],
+    "max_pose_step": [0.0001, 0.0001, 0.0001, 0.001, 0.001, 0.001],
+    "max_force": 20.0,
+    "max_torque": 3.0,
+    "torque_admittance_threshold": 0.1,
+    "contact_force_z": -3.0,
+    "force_integral_gain": 0.5,
+    "force_integral_limit": 50.0,
+    "integral_window": 250
+}

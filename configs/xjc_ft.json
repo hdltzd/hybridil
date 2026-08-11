@@ -1,0 +1,20 @@
+{
+    "port": "/dev/ttyUSB0",
+    "usb_selector": null,
+    "baudrate": 115200,
+    "timeout_s": 0.006,
+    "slave_address": 1,
+    "sample_rate": 250,
+    "zero_on_startup": true,
+    "zero_settle_seconds": 1.0,
+    "force_zero": [0.0, 0.0, 0.0],
+    "torque_zero": [0.0, 0.0, 0.0],
+    "gravity_in_aubo_base": [0.0, 0.0, 0.0],
+    "center_of_mass_in_sensor": [0.0, 0.0, 0.0],
+    "XJC_2_TCP": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ]
+}

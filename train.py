@@ -190,6 +190,10 @@ def train(config, device, auto_remove_exp=False, resume=None):
         shuffle=(train_sampler is None),
         num_workers=config.train.num_data_workers,
         drop_last=True
+
+        # pin_memory=True,          # 开启锁页内存
+        # persistent_workers=True,  # worker进程常驻
+        # prefetch_factor=2         # 每个worker提前预取2个batch
     )
 
     if config.experiment.validate:

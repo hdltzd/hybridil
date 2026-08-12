@@ -226,9 +226,12 @@ class AuboActionExecutor:
             )
 
     def _send_pose(self, position, quat) -> None:
-        joints = self.robot.inverse_kinematics(position, quat)
-        self.robot.servo_joints(
-            joints,
+        # 与参考项目的 process_command + send_command 一致：每一个笛卡尔
+        # 目标都在同一机器人适配器内完成 IK 和 ServoJ，失败立即停止本进程
+        # 持有的伺服，不能继续发送下一帧。
+        self.robot.servo_tcp_pose(
+            position,
+            quat,
             duration_s=self.servo_duration,
             lookahead_s=self.servo_lookahead,
             gain=self.servo_gain,
@@ -343,6 +346,7 @@ def build_live_hardware(config: Dict, frames: CoordinateFrames):
         rpc_port=robot_config.get("rpc_port", 30004),
         username=robot_config.get("username", "aubo"),
         password=password,
+        robot_name=robot_config.get("robot_name"),
         request_timeout_ms=robot_config.get("request_timeout_ms", 1000),
         max_joint_step_rad=robot_config.get("max_joint_step_rad", np.deg2rad(1.0)),
     )

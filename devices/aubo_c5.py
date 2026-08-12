@@ -55,6 +55,7 @@ class AuboC5Robot:
         rpc_port: int = 30004,
         username: str = "aubo",
         password: str = "123456",
+        robot_name: Optional[str] = None,
         request_timeout_ms: int = 1000,
         max_joint_step_rad: float = np.deg2rad(1.0),
     ) -> None:
@@ -79,6 +80,7 @@ class AuboC5Robot:
         self.rpc_port = int(rpc_port)
         self.username = username
         self.request_timeout_ms = int(request_timeout_ms)
+        self.requested_robot_name = robot_name
         self.max_joint_step_rad = float(max_joint_step_rad)
         self.client = None
         self.robot_name = None
@@ -114,7 +116,14 @@ class AuboC5Robot:
                 raise AuboConnectionError(
                     "AUBO RPC is connected but reported no robot interfaces"
                 )
-            self.robot_name = robot_names[0]
+            if robot_name is not None and robot_name not in robot_names:
+                raise AuboConnectionError(
+                    "Configured robot_name {!r} is not available; controller reports {}".format(
+                        robot_name,
+                        robot_names,
+                    )
+                )
+            self.robot_name = robot_name or robot_names[0]
             self.robot = self.client.getRobotInterface(self.robot_name)
             self.robot_state = self.robot.getRobotState()
             self.robot_manage = self.robot.getRobotManage()
@@ -166,6 +175,29 @@ class AuboC5Robot:
         }
 
     @staticmethod
+    def _enum_name(value) -> str:
+        """Return an SDK enum name without depending on one SDK version."""
+        return str(getattr(value, "name", ""))
+
+    @classmethod
+    def _is_running_mode(cls, value) -> bool:
+        # The reference program compares against ``RobotModeType.Running``.
+        # Prefer that stable name; retain the numeric fallback for SDK builds
+        # whose pybind enum object exposes only ``value``.
+        return cls._enum_name(value).lower() == "running" or int(
+            getattr(value, "value", value)
+        ) == cls.RUNNING_MODE_VALUE
+
+    @classmethod
+    def _is_motion_safety_mode(cls, value) -> bool:
+        # Match the reference program's Normal / ReducedMode semantics rather
+        # than allowing Recovery, ProtectiveStop, or any stop/error mode.
+        name = cls._enum_name(value).lower()
+        if name:
+            return name in ("normal", "reducedmode", "reduced_mode")
+        return int(getattr(value, "value", value)) in cls.MOTION_SAFETY_MODE_VALUES
+
+    @staticmethod
     def _as_vector(
         values: Sequence[float],
         size: int,
@@ -209,11 +241,10 @@ class AuboC5Robot:
         self._require_open()
         robot_mode = self.robot_state.getRobotModeType()
         safety_mode = self.robot_state.getSafetyModeType()
-        robot_mode_value = int(getattr(robot_mode, "value", robot_mode))
-        safety_mode_value = int(getattr(safety_mode, "value", safety_mode))
         return (
-            robot_mode_value == self.RUNNING_MODE_VALUE
-            and safety_mode_value in self.MOTION_SAFETY_MODE_VALUES
+            self._is_running_mode(robot_mode)
+            and self._is_motion_safety_mode(safety_mode)
+            and self.robot_state.isPowerOn()
             and not self.robot_state.isCollisionOccurred()
         )
 
@@ -222,9 +253,11 @@ class AuboC5Robot:
             status = self.get_status()
             raise AuboSafetyError(
                 "AUBO motion is not allowed: robot_mode={}, safety_mode={}, "
-                "collision={}".format(
+                "power_on={}, steady={}, collision={}".format(
                     status["robot_mode"],
                     status["safety_mode"],
+                    status["is_power_on"],
+                    status["is_steady"],
                     status["is_collision_occurred"],
                 )
             )
@@ -347,15 +380,57 @@ class AuboC5Robot:
             if rest_joints is None
             else self._as_vector(rest_joints, self.DOF, "IK seed")
         )
-        result, code = self.robot_algorithm.inverseKinematics(
-            seed.tolist(),
-            pose_command,
-        )
+        try:
+            result, code = self.robot_algorithm.inverseKinematics(
+                seed.tolist(),
+                pose_command,
+            )
+        except Exception as error:
+            raise AuboCommandError(
+                "AUBO inverseKinematics RPC exception for pose {}: {}".format(
+                    np.asarray(pose_command).round(8).tolist(),
+                    error,
+                )
+            ) from error
         if int(code) != 0:
             raise AuboCommandError(
-                "AUBO inverseKinematics failed with code {}".format(code)
+                "AUBO inverseKinematics failed with code {} for pose {}".format(
+                    code,
+                    np.asarray(pose_command).round(8).tolist(),
+                )
             )
         return self.validate_joint_target(result, enforce_step_limit=False)
+
+    def servo_tcp_pose(
+        self,
+        xyz_in_base: Sequence[float],
+        quat_xyzw_in_base: Sequence[float],
+        duration_s: float = 0.008,
+        lookahead_s: float = 0.1,
+        gain: float = 200.0,
+    ) -> np.ndarray:
+        """Reference-style Cartesian command pipeline: IK then one ServoJ.
+
+        This is deliberately the only Cartesian motion entry point used by
+        deployment. A failure in either stage stops motion owned by this
+        process and propagates a diagnostic error; it never powers off,
+        unlocks a stop, or retries a stale target.
+        """
+        try:
+            joints = self.inverse_kinematics(xyz_in_base, quat_xyzw_in_base)
+            self.servo_joints(
+                joints,
+                duration_s=duration_s,
+                lookahead_s=lookahead_s,
+                gain=gain,
+            )
+            return joints
+        except Exception:
+            try:
+                self.stop()
+            except Exception:
+                pass
+            raise
 
     def power_on_and_startup(
         self,

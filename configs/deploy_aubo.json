@@ -35,6 +35,7 @@
         "ip": "192.168.100.20",
         "rpc_port": 30004,
         "username": "aubo",
+        "password": null,
         "password_env": "AUBO_PASSWORD",
         "request_timeout_ms": 1000,
         "max_joint_step_rad": 0.0017453292519943296,

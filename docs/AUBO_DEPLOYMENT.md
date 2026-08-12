@@ -91,11 +91,19 @@ D455_2_AUBO_BASE = np.linalg.inv(BASEr_2_BASE) @ D455_2_BASE
 实时控制不通过 AprilTag 读取力，因此力补偿使用单独标定的 `XJC_2_TCP`。配置中的
 `gravity_in_aubo_base` 明确表示重力向量写在 AUBO 机械臂基座坐标系，而不是公共 `BASE`。
 
-设置 AUBO 登录密码时不写入配置文件：
+默认优先读取部署配置的 ``robot.password``；也可以不填写该项而改用环境变量：
 
 ```bash
 export AUBO_PASSWORD='实际密码'
 ```
+
+若直接写入配置，在 ``configs/deploy_aubo.json`` 中填写：
+
+```json
+"password": "实际密码"
+```
+
+密码属于敏感信息，不应提交到 Git 仓库或上传到共享位置。
 
 第一次联机仍保持 `allow_motion=false` 且不添加 `--execute`，只检查实时观测和模型输出。
 确认坐标、力符号、工作空间和急停后，才允许空载低速执行。

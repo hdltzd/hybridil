@@ -113,11 +113,14 @@ def main():
     args = parse_args()
     config = load_config(args.config)
     robot_config = config["robot"]
+    password = robot_config.get("password")
     password_env = robot_config.get("password_env", "AUBO_PASSWORD")
-    password = os.environ.get(password_env)
-    if password is None:
+    if not password:
+        password = os.environ.get(password_env)
+    if not isinstance(password, str) or not password:
         raise RuntimeError(
-            "Set the {} environment variable for AUBO login".format(password_env)
+            "Set robot.password in the deployment config or set the {} environment "
+            "variable for AUBO login".format(password_env)
         )
 
     with AuboC5Robot(

@@ -328,10 +328,16 @@ def build_live_hardware(config: Dict, frames: CoordinateFrames):
     from devices.xjc_ft import XjcForceTorqueSensor
 
     robot_config = config["robot"]
-    password_env = robot_config.get("password_env", "AUBO_PASSWORD")
-    password = os.environ.get(password_env)
-    if password is None:
-        raise RuntimeError("Set the {} environment variable for AUBO login".format(password_env))
+    # ``password`` 用于目标电脑的本地配置；未填写时仍可沿用环境变量。
+    password = robot_config.get("password")
+    if not password:
+        password_env = robot_config.get("password_env", "AUBO_PASSWORD")
+        password = os.environ.get(password_env)
+    if not isinstance(password, str) or not password:
+        raise RuntimeError(
+            "Set robot.password in the deployment config or set the {} environment variable "
+            "for AUBO login".format(robot_config.get("password_env", "AUBO_PASSWORD"))
+        )
     robot = AuboC5Robot(
         robot_ip=robot_config["ip"],
         rpc_port=robot_config.get("rpc_port", 30004),

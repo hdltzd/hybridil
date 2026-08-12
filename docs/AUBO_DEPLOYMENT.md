@@ -113,6 +113,19 @@ export AUBO_PASSWORD='实际密码'
 是软件看门狗：状态、力传感器、控制计算或 ServoJ 调用超时都会中止动作；位置模式也会
 每周期读取并检查实测六维力。XJC 串口单次等待为 `6 ms`，以便在看门狗截止前退出。
 
+## AUBO 接口与参考控制程序的关系
+
+部署驱动的连接、接口获取、IK 和 `servoJoint` 参数沿用参考程序的 AUBO SDK 调用方式：
+`RpcClient.connect(ip, 30004)`、登录、`getRobotInterface`、`inverseKinematics` 和
+`servoJoint(q, 0, 0, 0.008, 0.1, 200)`。每个模型笛卡尔目标在
+`AuboC5Robot.servo_tcp_pose` 中依次完成 IK 与 ServoJ；IK 或 ServoJ 出错时停止本进程
+启用的伺服，不再继续发送动作。
+
+配置中的 `robot.robot_name` 默认为 `null`，即选择控制器报告的第一个机器人；多机器人
+控制柜可填写明确名称以避免选错接口。该项目不会复制参考程序中连接后自动解锁保护停止、
+关闭碰撞检测、上电、回初始化位、重启运行时机器或覆写 TCP 的行为。这些状态改变必须在
+示教器上由操作者确认，或以后通过单独、显式的维护程序执行。
+
 ## 控制逻辑
 
 模型位姿在相机坐标系，先按 `pose.py` 转到公共 `BASE`，再转换到 AUBO 基坐标系后求逆运动学。模型 wrench 保持在 TCP

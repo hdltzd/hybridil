@@ -223,6 +223,41 @@ class TestAuboMotionOwnership(unittest.TestCase):
         self.assertFalse(robot.motion_control.servo_enabled)
         self.assertFalse(robot._motion_owned)
 
+    def test_cartesian_servo_pipeline_stops_after_ik_failure(self):
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        calls = []
+
+        def failed_ik(position, quaternion):
+            calls.append("ik")
+            raise AuboCommandError("IK failed")
+
+        def stopped():
+            calls.append("stop")
+
+        robot.inverse_kinematics = failed_ik
+        robot.servo_joints = lambda *args, **kwargs: calls.append("servoj")
+        robot.stop = stopped
+
+        with self.assertRaisesRegex(AuboCommandError, "IK failed"):
+            robot.servo_tcp_pose([0, 0, 0], [0, 0, 0, 1])
+
+        self.assertEqual(calls, ["ik", "stop"])
+
+    def test_cartesian_servo_pipeline_calls_ik_then_servoj(self):
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        calls = []
+        joints = np.arange(6, dtype=np.float64)
+        robot.inverse_kinematics = lambda position, quaternion: calls.append("ik") or joints
+        robot.servo_joints = lambda value, **kwargs: calls.append(("servoj", value))
+        robot.stop = lambda: calls.append("stop")
+
+        result = robot.servo_tcp_pose([0, 0, 0], [0, 0, 0, 1])
+
+        np.testing.assert_array_equal(result, joints)
+        self.assertEqual(calls[0], "ik")
+        self.assertEqual(calls[1][0], "servoj")
+        self.assertNotIn("stop", calls)
+
 
 class TestXjcInitialization(unittest.TestCase):
     class FakeSensor:
@@ -273,11 +308,9 @@ class TestAuboActionExecutorSafety(unittest.TestCase):
             self.assert_matrix = matrix
             return np.eye(4)
 
-        def inverse_kinematics(self, position, quat):
-            return np.zeros(6)
-
-        def servo_joints(self, joints, **kwargs):
+        def servo_tcp_pose(self, position, quat, **kwargs):
             self.servo_calls += 1
+            return np.zeros(6)
 
     @staticmethod
     def make_controller():

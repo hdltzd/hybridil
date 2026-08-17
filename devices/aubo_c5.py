@@ -15,7 +15,6 @@ Pose conventions exposed by this module:
 """
 
 import time
-from numbers import Real
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +37,14 @@ class AuboCommandError(AuboError):
     """An AUBO SDK command returned a non-zero result."""
 
 
+class AuboQueueFullError(AuboCommandError):
+    """AUBO temporarily rejected ServoJ because its command queue is full.
+
+    Return code 2 is backpressure rather than a robot fault.  The realtime
+    deployment loop may discard that one sample and retry on its next tick.
+    """
+
+
 class AuboC5Robot:
     """AUBO C5 RPC state and motion adapter.
 
@@ -57,7 +64,6 @@ class AuboC5Robot:
         password: str = "123456",
         robot_name: Optional[str] = None,
         request_timeout_ms: int = 1000,
-        max_joint_step_rad: float = np.deg2rad(1.0),
     ) -> None:
         self._validate_connection_parameters(
             robot_ip,
@@ -65,7 +71,6 @@ class AuboC5Robot:
             username,
             password,
             request_timeout_ms,
-            max_joint_step_rad,
         )
         try:
             import pyaubo_sdk
@@ -81,7 +86,6 @@ class AuboC5Robot:
         self.username = username
         self.request_timeout_ms = int(request_timeout_ms)
         self.requested_robot_name = robot_name
-        self.max_joint_step_rad = float(max_joint_step_rad)
         self.client = None
         self.robot_name = None
         self.robot = None
@@ -150,7 +154,6 @@ class AuboC5Robot:
         username,
         password,
         request_timeout_ms,
-        max_joint_step_rad,
     ) -> None:
         if not isinstance(robot_ip, str) or not robot_ip:
             raise ValueError("robot_ip must be a non-empty string")
@@ -164,8 +167,6 @@ class AuboC5Robot:
             raise ValueError("password must be a string")
         if not isinstance(request_timeout_ms, int) or request_timeout_ms <= 0:
             raise ValueError("request_timeout_ms must be a positive integer")
-        if not isinstance(max_joint_step_rad, Real) or max_joint_step_rad <= 0:
-            raise ValueError("max_joint_step_rad must be positive")
 
     @staticmethod
     def _enum_description(value) -> Dict[str, object]:
@@ -341,22 +342,12 @@ class AuboC5Robot:
     def validate_joint_target(
         self,
         target_joints: Sequence[float],
-        enforce_step_limit: bool = True,
     ) -> np.ndarray:
+        """检查目标是否处于AUBO SDK报告的绝对关节范围内。"""
         target = self._as_vector(target_joints, self.DOF, "target joints")
         lower, upper = self.get_joint_limits()
         if np.any(target < lower) or np.any(target > upper):
             raise AuboSafetyError("Target joints exceed AUBO joint limits")
-        if enforce_step_limit:
-            current = self.get_joint_pos()
-            max_step = float(np.max(np.abs(target - current)))
-            if max_step > self.max_joint_step_rad:
-                raise AuboSafetyError(
-                    "Joint target step {:.6f} rad exceeds {:.6f} rad".format(
-                        max_step,
-                        self.max_joint_step_rad,
-                    )
-                )
         return target
 
     def inverse_kinematics(
@@ -399,7 +390,7 @@ class AuboC5Robot:
                     np.asarray(pose_command).round(8).tolist(),
                 )
             )
-        return self.validate_joint_target(result, enforce_step_limit=False)
+        return self.validate_joint_target(result)
 
     def servo_tcp_pose(
         self,
@@ -425,6 +416,10 @@ class AuboC5Robot:
                 gain=gain,
             )
             return joints
+        except AuboQueueFullError:
+            # 队列满是临时背压。不能在驱动层停止Servo模式，否则控制循环
+            # 无法在下一周期恢复；是否连续过多由部署层统一判断。
+            raise
         except Exception:
             try:
                 self.stop()
@@ -520,7 +515,7 @@ class AuboC5Robot:
             raise AuboSafetyError("AUBO servo mode is not enabled")
         if duration_s <= 0 or lookahead_s <= 0 or gain <= 0:
             raise ValueError("ServoJ timing and gain values must be positive")
-        target = self.validate_joint_target(target_joints, enforce_step_limit=True)
+        target = self.validate_joint_target(target_joints)
         code = int(
             self.motion_control.servoJoint(
                 target.tolist(),
@@ -531,11 +526,40 @@ class AuboC5Robot:
                 float(gain),
             )
         )
+        if code == 2:
+            raise AuboQueueFullError("AUBO ServoJ queue is full (code 2)")
         if code != 0:
             self.stop()
             raise AuboCommandError(
                 "AUBO servoJoint failed with code {}".format(code)
             )
+
+    def send_command(
+        self,
+        joint_positions: Sequence[float],
+        ik_code: int,
+        duration_s: float = 0.008,
+        lookahead_s: float = 0.1,
+        gain: float = 200.0,
+    ) -> None:
+        """兼容参考AUBO项目的 ``send_command(joints, ik_code)`` 接口。
+
+        逆解失败时不发送任何运动命令；逆解成功时底层仍调用servoJoint。
+        与参考代码不同，这里不会因为IK失败自动下电，只停止本进程控制并
+        抛出异常交给部署入口处理。
+        """
+        if int(ik_code) != 0:
+            raise AuboCommandError(
+                "AUBO inverseKinematics result cannot be sent (code {})".format(
+                    int(ik_code)
+                )
+            )
+        self.servo_joints(
+            joint_positions,
+            duration_s=duration_s,
+            lookahead_s=lookahead_s,
+            gain=gain,
+        )
 
     def move_joints(
         self,
@@ -552,7 +576,7 @@ class AuboC5Robot:
             raise ValueError("MoveJ limits and timeout must be positive")
         if self.motion_control.isServoModeEnabled():
             raise AuboSafetyError("Disable servo mode before using move_joints")
-        target = self.validate_joint_target(target_joints, enforce_step_limit=True)
+        target = self.validate_joint_target(target_joints)
         self._motion_owned = True
         code = int(
             self.motion_control.moveJoint(

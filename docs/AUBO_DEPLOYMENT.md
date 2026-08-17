@@ -6,8 +6,8 @@ Flexiv 控制类，也不会导入按摩机器人的业务代码，只复用了�
 
 ## 安全边界
 
-默认配置为 `source.mode=replay`、`robot.allow_motion=false`，不会连接机械臂。真实运动必须
-同时满足以下条件：
+真实运动必须同时满足以下条件（移植到新电脑时应先把 `allow_motion` 设为
+`false` 完成只读检查）：
 
 1. 配置改为 `source.mode=live`；
 2. `pose.py` 中的 `D455_2_BASE` 和 `BASEr_2_BASE` 已经标定，
@@ -76,6 +76,25 @@ python tests/d455_hardware_smoke.py --frames 300 --restart-check
 - `configs/pose.py` 的 `BASEr_2_BASE`（在新单臂系统中，`BASEr` 就是 AUBO 基座）；
 - `configs/xjc_ft.json` 的补偿参数。
 
+目标工控机实测运行参考 `force_sensor.py` 时，已经能够直接打开并读取
+`/dev/ttyRobotTool`。这说明控制柜串口转发和虚拟设备创建已由现有系统完成，HybridIL
+部署只需要用 PySerial 以 `115200` 波特率复用该设备：
+
+```json
+"port": "/dev/ttyRobotTool",
+"transport": null
+```
+
+先确认设备存在且当前用户可以读写，再运行：
+
+```bash
+ls -l /dev/ttyRobotTool
+python tests/xjc_hardware_smoke.py --config configs/xjc_ft.json --samples 1000
+```
+
+部署程序不会再次启动 `socat`、连接 SSH 或重启控制柜 `ser2net`，也不会删除现有的
+`/dev/ttyRobotTool`。冒烟脚本只进行协议读取，不会置零传感器或发送机械臂运动。
+
 矩阵命名完全沿用 `pose.py` 的规则：`A_2_B` 表示将 A 系坐标变换到 B 系。
 公共 `BASE` 仍然是独立公共参考系；新单臂部署把 `BASEr` 明确定义为 AUBO 基座。运行时使用：
 
@@ -108,10 +127,10 @@ export AUBO_PASSWORD='实际密码'
 第一次联机仍保持 `allow_motion=false` 且不添加 `--execute`，只检查实时观测和模型输出。
 确认坐标、力符号、工作空间和急停后，才允许空载低速执行。
 
-当前初次联机参数有意采用保守限制：125 Hz 下 TCP 平移每周期最多 `0.1 mm`、
-旋转最多 `0.001 rad`，关节目标每周期最多 `0.1°`。`control_timeout_s=0.02`
-是软件看门狗：状态、力传感器、控制计算或 ServoJ 调用超时都会中止动作；位置模式也会
-每周期读取并检查实测六维力。XJC 串口单次等待为 `6 ms`，以便在看门狗截止前退出。
+当前部署基准已提高到100 Hz：TCP平移和旋转每周期最多分别为 `1.2 mm` 和
+`0.0012 rad`，对应最大速度为 `0.12 m/s` 和 `0.12 rad/s`。这与此前60 Hz、
+2 mm/周期的实机速度等效。位置Servo循环不读取
+XJC；XJC只作为模型观测。偶发Python周期延迟会记录警告，不再立即中止动作。
 
 ## AUBO 接口与参考控制程序的关系
 
@@ -157,3 +176,122 @@ BASE是公共参考系，BASEr作为AUBO基座；
 D455、AUBO、XJC驱动分阶段验证；
 真实运动必须经过坐标标定、XJC清零、工作空间和力安全检查；
 当前优先目标是目标电脑完成“真实硬件观测 → 模型推理 → 只打印动作”的闭环，而不是立刻执行削皮。
+# 通用任务准备阶段
+
+对于机械臂默认构型距离训练任务区域较远的情况，不要让HybridIL通过局部
+ServoJ从远处追踪模型目标。`deploy_aubo.py`提供显式的`--prepare`流程：
+
+```text
+低速MoveJ经过init_joint_waypoints_rad
+→ 采集一次实时观测并调用策略
+→ 取第一预测位姿定位任务区域
+→ 沿配置的工具前向轴反方向退让retreat_distance_m
+→ 对ready_pose求IK并低速MoveJ到达
+→ 丢弃本次预测
+→ 重新采集观测并进入实时HybridIL控制
+```
+
+准备阶段有两道运动授权：`robot.allow_motion=true`和
+`preparation.enabled=true`，命令行还必须同时提供`--prepare --execute`。
+`init_joint_waypoints_rad`是按执行顺序排列的关节路点；MoveJ不提供避障，
+这些路点必须先在现场通过示教器确认。配置中的参考AUBO `init_pos`仅为候选，
+不能直接视为任何新任务的安全路径。
+
+首次运行保持`move_to_policy_ready=false`：程序只移动到已确认的初始化路点，
+打印策略生成的ready位姿和IK关节角后退出。人工核对结果与MoveJ路径后，再将
+其设为`true`，第二次运行才会移动到ready位姿并进入实时控制。
+
+```bash
+python deploy_aubo.py \
+  --config configs/deploy_aubo.json \
+  --prepare \
+  --max-policy-calls 1 \
+  --execute
+```
+
+如果任务物体位于TCP正Z方向，使用`tool_forward_axis: "+z"`；程序会沿TCP
+负Z退让。如果实际工具前向为负Z，则配置为`"-z"`。
+
+## 启动方式
+首次从任意位置启动，需要经过初始化位置：
+python deploy_aubo.py \
+  --config configs/deploy_aubo.json \
+  --prepare \
+  --max-policy-calls 100 \
+  --execute
+机械臂已经在任务区域，只需要重新计算预备位置：
+python deploy_aubo.py \
+  --config configs/deploy_aubo.json \
+  --prepare \
+  --max-policy-calls 100 \
+  --execute
+机械臂已经在合适位置，直接实时推理：
+python deploy_aubo.py \
+  --config configs/deploy_aubo.json \
+  --max-policy-calls 100 \
+  --execute
+# 导纳柔顺位置控制与验收（2026-08）
+
+部署入口现在只有 `SingleServoControlLoop` 一个线程能够调用 AUBO
+`servoJoint`。没有轨迹时，该线程保持最后一次成功发送的TCP位姿；有轨迹时，
+它以100 Hz持续发送，并把30 Hz动作按位置线性插值和四元数SLERP生成Servo
+目标。实时任务设置为 `force_position`：非接触动作段以模型TCP位姿为平衡
+位姿、以零六维力为期望外力；预测力超过阈值后切换到力位混合段，使用模型
+预测六维力作为期望力。两个阶段都由 `AuboAdmitHybridController` 计算本周期
+TCP命令，以上一次成功关节解为IK种子，再经参考项目同名的
+`send_command(joint_positions, ik_code)` 调用底层ServoJ。
+
+阻塞式 `moveJoint` 不用于实时柔顺闭环，只在 `--prepare` 阶段低速移动到
+`init_pos` 和 `ready_pose`。质量、刚度、阻尼以及导纳速度/加速度限制位于
+`configs/aubo_admit_hybrid.json`。
+
+`servoJoint` 返回 `code 2` 时按队列背压处理：丢弃当前Servo帧、不更新
+最后成功目标，下一周期重新读取机器人状态。连续5次队列满才停止。其他非零
+返回码仍立即停止。运行日志会输出Servo尝试/成功/队列满、最大连续队列满、
+实际发送频率、RPC和控制周期耗时、XJC样本年龄/错误以及推理延迟。
+
+XJC串口只能由250 Hz采集线程读取。策略观测读取最近一次有效缓存；样本年龄
+只写入统计，不参与位置Servo停止判断。采集线程永久失败或始终没有有效样本时，
+新的模型观测仍会失败并保持最后成功位姿。
+
+60 Hz连续实机测试通过后，正式配置使用以下100 Hz基准：
+
+```json
+{
+  "control_rate_hz": 100,
+  "action_rate_hz": 30,
+  "control_mode": "force_position",
+  "position_command": "send_command",
+  "control_timeout_s": 0.1,
+  "position_step_m": 0.0012,
+  "rotation_step_rad": 0.0012,
+  "max_tcp_speed_m_s": 0.12,
+  "max_tcp_angular_speed_rad_s": 0.12,
+  "prefetch_after_actions": 5
+}
+```
+
+严格按以下顺序真机执行，并保存每次输出的完整JSON统计：
+
+```bash
+python deploy_aubo.py --config configs/deploy_aubo.json --hold-seconds 30 --execute
+python deploy_aubo.py --config configs/deploy_aubo.json --max-policy-calls 1 --execute
+python deploy_aubo.py --config configs/deploy_aubo.json --max-policy-calls 10 --execute
+python deploy_aubo.py --config configs/deploy_aubo.json --max-policy-calls 100 --execute
+```
+
+保持模式不连接D455和 `node.py`，也不运行模型，只初始化AUBO、XJC并保持
+启动瞬间的TCP位姿。它不能与 `--prepare`、回放或不带 `--execute` 的命令
+组合。
+
+部署使用NumPy多帧ZeroMQ协议传输点云，原Flexiv客户端的单帧JSON协议仍兼容。
+每次10步预测执行到第5步后，主线程采集下一次观测并请求推理；唯一Servo线程
+继续执行剩余动作。若推理晚于当前轨迹，机械臂保持最后成功位姿，不进行速度
+外推。ZeroMQ REQ socket只由主线程使用，不再启动额外的异步推理线程。
+
+`servoJoint`命令持续时间由程序自动设为 `1/control_rate_hz`，不再单独配置
+`servo_duration_s`。100 Hz只提高Servo目标刷新频率，不提高模型的30 Hz动作频率，也不提高TCP
+速度上限；若出现持续队列满或Servo错误，应先恢复60 Hz基准排查通信节拍。
+
+不要恢复 `max_joint_step_rad`。仍保留AUBO绝对关节限位、TCP工作空间、TCP
+速度/角速度、IK失败、ServoJ错误、队列背压、碰撞状态和人工急停保护。

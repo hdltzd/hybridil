@@ -1,8 +1,9 @@
-# AUBO/D455 实时进程的轻量依赖；不需要训练环境中的 PyTorch、h5py、open3d。
-numpy>=1.23
-scipy>=1.9
-pyzmq>=24
-pyserial>=3.5
-pyrealsense2>=2.50
-
-# pyaubo_sdk 由 AUBO 官方 SDK/现有 aubo_massage 环境提供，不从 PyPI 安装。
+numpy>=1.13.3
+scipy
+opencv-python==4.8.0.76
+open3d>=0.18.0
+pyrealsense2==2.53.1.4623
+pin==3.4.0
+pynput
+zmq
+pin

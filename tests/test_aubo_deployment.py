@@ -1,7 +1,10 @@
 import tempfile
+import threading
 import time
 import unittest
+from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -11,8 +14,14 @@ from configs import pose as global_pose
 from controllers.aubo_admit_hybrid import AuboAdmitHybridController
 from deploy_aubo import (
     AuboActionExecutor,
+    LiveObservationSource,
     initialize_xjc_sensor,
     make_coordinate_frames,
+    make_controller,
+    make_policy_ready_pose,
+    solve_continuous_joint_targets,
+    load_json,
+    validate_deployment_config,
 )
 from deployment.aubo_hybridil import (
     ActionChunkPlanner,
@@ -21,7 +30,21 @@ from deployment.aubo_hybridil import (
     ReplaySource,
     transform_action_to_aubo_base,
 )
-from devices.aubo_c5 import AuboC5Robot, AuboCommandError
+from deployment.aubo_runtime import (
+    LatestWrenchCache,
+    RuntimeStatistics,
+    ServoBackpressure,
+    ServoCommandPacer,
+    SingleServoControlLoop,
+    interpolate_pose,
+    interpolate_wrench,
+)
+from devices.aubo_c5 import (
+    AuboC5Robot,
+    AuboCommandError,
+    AuboQueueFullError,
+)
+from devices.xjc_ft import XjcProtocolError
 
 
 def action_trajectory(count, force):
@@ -96,6 +119,108 @@ class TestCoordinateConversion(unittest.TestCase):
         np.testing.assert_allclose(wrench, action[7:])
 
 
+class TestContinuousIK(unittest.TestCase):
+    class Robot:
+        def __init__(self):
+            self.seeds = []
+
+        def get_joint_pos(self):
+            return np.zeros(6)
+
+        def inverse_kinematics(self, position, quaternion, rest_joints=None):
+            seed = np.asarray(rest_joints, dtype=np.float64)
+            self.seeds.append(seed.copy())
+            return seed + 0.1
+
+    def test_each_ik_uses_previous_solution_as_seed(self):
+        robot = self.Robot()
+        actions = action_trajectory(3, [0.0, 0.0, 0.0])
+
+        targets, codes = solve_continuous_joint_targets(
+            robot,
+            actions,
+            np.eye(4),
+            [[-1, 1], [-1, 1], [-1, 1]],
+        )
+
+        np.testing.assert_allclose(robot.seeds[0], np.zeros(6))
+        np.testing.assert_allclose(robot.seeds[1], np.full(6, 0.1))
+        np.testing.assert_allclose(robot.seeds[2], np.full(6, 0.2))
+        np.testing.assert_allclose(targets[-1], np.full(6, 0.3))
+        np.testing.assert_array_equal(codes, np.zeros(3, dtype=np.int64))
+
+
+class TestLiveWrenchReading(unittest.TestCase):
+    class IdentityCompensator:
+        def compensate(self, raw, quaternion):
+            return np.asarray(raw, dtype=np.float64)
+
+    class IntermittentSensor:
+        def __init__(self, failures):
+            self.failures = failures
+            self.calls = 0
+
+        def read(self):
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise XjcProtocolError("missing streaming header")
+            return np.arange(6, dtype=np.float64)
+
+    def make_source(self, failures, retries=3):
+        source = LiveObservationSource.__new__(LiveObservationSource)
+        source.sensor = self.IntermittentSensor(failures)
+        source.compensator = self.IdentityCompensator()
+        source.sensor_lock = threading.Lock()
+        source.sensor_read_retries = retries
+        return source
+
+    def test_transient_streaming_errors_are_retried(self):
+        source = self.make_source(failures=2, retries=3)
+
+        wrench = source.read_compensated_wrench([0, 0, 0, 1])
+
+        np.testing.assert_array_equal(wrench, np.arange(6, dtype=np.float64))
+        self.assertEqual(source.sensor.calls, 3)
+
+    def test_consecutive_streaming_errors_still_stop_deployment(self):
+        source = self.make_source(failures=3, retries=3)
+
+        with self.assertRaisesRegex(XjcProtocolError, "3 consecutive times"):
+            source.read_compensated_wrench([0, 0, 0, 1])
+
+
+class TestPolicyReadyPose(unittest.TestCase):
+    def test_positive_tool_z_retreats_along_negative_tool_z(self):
+        action = np.zeros(13, dtype=np.float64)
+        action[:3] = [0.1, 0.2, 0.3]
+        action[3:7] = [0.0, 0.0, 0.0, 1.0]
+
+        ready, quat, target = make_policy_ready_pose(
+            action,
+            np.eye(4),
+            retreat_distance_m=0.08,
+            tool_forward_axis="+z",
+        )
+
+        np.testing.assert_allclose(target, [0.1, 0.2, 0.3])
+        np.testing.assert_allclose(ready, [0.1, 0.2, 0.22])
+        np.testing.assert_allclose(quat, [0.0, 0.0, 0.0, 1.0])
+
+    def test_negative_tool_z_retreats_along_positive_tool_z(self):
+        action = np.zeros(13, dtype=np.float64)
+        action[:3] = [0.1, 0.2, 0.3]
+        action[3:7] = [0.0, 0.0, 0.0, 1.0]
+
+        ready, _, _ = make_policy_ready_pose(
+            action,
+            np.eye(4),
+            retreat_distance_m=0.08,
+            tool_forward_axis="-z",
+        )
+
+        np.testing.assert_allclose(ready, [0.1, 0.2, 0.38])
+
+
 class TestActionChunkPlanner(unittest.TestCase):
     def test_low_force_selects_position(self):
         planner = ActionChunkPlanner(force_threshold=6.0, force_ratio=0.2)
@@ -168,6 +293,25 @@ class TestReplaySource(unittest.TestCase):
 
 
 class TestAuboMotionOwnership(unittest.TestCase):
+    def test_reference_send_command_delegates_to_servoj(self):
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        calls = []
+        robot.servo_joints = lambda joints, **kwargs: calls.append(
+            (np.asarray(joints).copy(), kwargs)
+        )
+
+        robot.send_command(np.arange(6), 0, duration_s=0.01)
+
+        np.testing.assert_array_equal(calls[0][0], np.arange(6))
+        self.assertEqual(calls[0][1]["duration_s"], 0.01)
+
+    def test_reference_send_command_rejects_failed_ik(self):
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        robot.servo_joints = lambda *args, **kwargs: self.fail("must not send")
+
+        with self.assertRaisesRegex(AuboCommandError, "code -23"):
+            robot.send_command(np.zeros(6), -23)
+
     class FakeMotionControl:
         def __init__(self):
             self.stop_calls = 0
@@ -258,14 +402,489 @@ class TestAuboMotionOwnership(unittest.TestCase):
         self.assertEqual(calls[1][0], "servoj")
         self.assertNotIn("stop", calls)
 
+    def test_cartesian_queue_full_does_not_stop_servo(self):
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        calls = []
+        robot.inverse_kinematics = lambda position, quaternion: np.zeros(6)
+        robot.servo_joints = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AuboQueueFullError("queue full")
+        )
+        robot.stop = lambda: calls.append("stop")
+
+        with self.assertRaises(AuboQueueFullError):
+            robot.servo_tcp_pose([0, 0, 0], [0, 0, 0, 1])
+
+        self.assertEqual(calls, [])
+
+    def test_servoj_code_two_maps_to_queue_full_without_stop(self):
+        class Motion:
+            def isServoModeEnabled(self):
+                return True
+
+            def servoJoint(self, *args):
+                return 2
+
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        robot.motion_control = Motion()
+        robot.require_motion_allowed = lambda: None
+        robot.validate_joint_target = lambda target: np.asarray(target)
+        stops = []
+        robot.stop = lambda: stops.append(True)
+
+        with self.assertRaises(AuboQueueFullError):
+            robot.servo_joints(np.zeros(6))
+
+        self.assertEqual(stops, [])
+
+    def test_other_servoj_error_stops_immediately(self):
+        class Motion:
+            def isServoModeEnabled(self):
+                return True
+
+            def servoJoint(self, *args):
+                return -5
+
+        robot = AuboC5Robot.__new__(AuboC5Robot)
+        robot.motion_control = Motion()
+        robot.require_motion_allowed = lambda: None
+        robot.validate_joint_target = lambda target: np.asarray(target)
+        stops = []
+        robot.stop = lambda: stops.append(True)
+
+        with self.assertRaisesRegex(AuboCommandError, "code -5"):
+            robot.servo_joints(np.zeros(6))
+
+        self.assertEqual(stops, [True])
+
+
+class TestServoRuntime(unittest.TestCase):
+    class FakeRobot:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    def test_queue_full_success_resets_consecutive_count(self):
+        robot = self.FakeRobot()
+        stats = RuntimeStatistics()
+        backpressure = ServoBackpressure(
+            robot,
+            ServoCommandPacer(0.000001),
+            stats,
+            max_consecutive=5,
+        )
+
+        for _ in range(2):
+            accepted, _ = backpressure.send(
+                lambda: (_ for _ in ()).throw(AuboQueueFullError("full"))
+            )
+            self.assertFalse(accepted)
+        accepted, _ = backpressure.send(lambda: "ok")
+
+        self.assertTrue(accepted)
+        self.assertEqual(backpressure.consecutive, 0)
+        self.assertEqual(stats.snapshot()["servo_queue_full"], 2)
+        self.assertEqual(robot.stop_calls, 0)
+
+    def test_five_consecutive_queue_full_stops(self):
+        robot = self.FakeRobot()
+        backpressure = ServoBackpressure(
+            robot,
+            ServoCommandPacer(0.000001),
+            RuntimeStatistics(),
+            max_consecutive=5,
+        )
+        callback = lambda: (_ for _ in ()).throw(AuboQueueFullError("full"))
+
+        for _ in range(4):
+            self.assertFalse(backpressure.send(callback)[0])
+        with self.assertRaisesRegex(RuntimeError, "5 consecutive"):
+            backpressure.send(callback)
+
+        self.assertEqual(robot.stop_calls, 1)
+
+    def test_pacer_prevents_back_to_back_attempts(self):
+        class Clock:
+            def __init__(self):
+                self.now = 0.0
+                self.sleeps = []
+
+            def read(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.sleeps.append(seconds)
+                self.now += seconds
+
+        clock = Clock()
+        pacer = ServoCommandPacer(0.01, clock=clock.read, sleeper=clock.sleep)
+        pacer.wait()
+        pacer.wait()
+
+        self.assertEqual(len(clock.sleeps), 1)
+        self.assertAlmostEqual(clock.sleeps[0], 0.01)
+
+    def test_pose_interpolation_uses_slerp(self):
+        end_quat = Rot.from_euler("z", 90, degrees=True).as_quat()
+        position, quat = interpolate_pose(
+            [0, 0, 0],
+            [0, 0, 0, 1],
+            [2, 0, 0],
+            end_quat,
+            0.5,
+        )
+        np.testing.assert_allclose(position, [1, 0, 0])
+        np.testing.assert_allclose(
+            Rot.from_quat(quat).as_euler("xyz", degrees=True)[2],
+            45.0,
+            atol=1e-8,
+        )
+
+    def test_wrench_interpolation_is_linear(self):
+        np.testing.assert_allclose(
+            interpolate_wrench(np.zeros(6), np.arange(6), 0.5),
+            np.arange(6) * 0.5,
+        )
+
+    def test_admittance_position_uses_xjc_with_zero_desired_wrench(self):
+        class Controller:
+            max_force = 20.0
+            max_torque = 3.0
+
+            def __init__(self):
+                self.desired = None
+
+            def validate_measured_wrench(self, wrench):
+                return np.asarray(wrench, dtype=np.float64)
+
+            def step(self, **kwargs):
+                self.desired = kwargs["desired_wrench_tcp"].copy()
+                return (
+                    np.asarray(kwargs["target_position_base"]),
+                    np.asarray(kwargs["target_quat_xyzw_base"]),
+                )
+
+        config = load_json("configs/deploy_aubo.json")["execution"]
+        controller = Controller()
+        loop = SingleServoControlLoop(
+            robot=object(),
+            wrench_reader=lambda quaternion: np.ones(6),
+            controller=controller,
+            camera_to_aubo_base=np.eye(4),
+            config=config,
+            robot_lock=threading.RLock(),
+            statistics=RuntimeStatistics(),
+        )
+
+        position, quaternion = loop._compute_command(
+            np.eye(4),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            "position",
+            np.array([0.1, 0.2, 0.3]),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            np.ones(6) * 9.0,
+        )
+
+        np.testing.assert_array_equal(controller.desired, np.zeros(6))
+        np.testing.assert_array_equal(position, [0.1, 0.2, 0.3])
+        np.testing.assert_array_equal(quaternion, [0.0, 0.0, 0.0, 1.0])
+
+    def test_force_hybrid_uses_predicted_wrench(self):
+        class Controller:
+            max_force = 20.0
+            max_torque = 3.0
+
+            def __init__(self):
+                self.desired = None
+
+            def validate_measured_wrench(self, wrench):
+                return np.asarray(wrench, dtype=np.float64)
+
+            def step(self, **kwargs):
+                self.desired = kwargs["desired_wrench_tcp"].copy()
+                return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])
+
+        controller = Controller()
+        loop = SingleServoControlLoop(
+            robot=object(),
+            wrench_reader=lambda quaternion: np.zeros(6),
+            controller=controller,
+            camera_to_aubo_base=np.eye(4),
+            config=load_json("configs/deploy_aubo.json")["execution"],
+            robot_lock=threading.RLock(),
+            statistics=RuntimeStatistics(),
+        )
+        predicted = np.arange(6, dtype=np.float64)
+
+        loop._compute_command(
+            np.eye(4),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            "hybrid",
+            np.zeros(3),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            predicted,
+        )
+
+        np.testing.assert_array_equal(controller.desired, predicted)
+
+    @staticmethod
+    def make_buffer_only_loop():
+        loop = SingleServoControlLoop.__new__(SingleServoControlLoop)
+        loop._condition = threading.Condition()
+        loop._pending = deque()
+        loop._replacement = None
+        loop._current = None
+        loop._current_started = None
+        loop._current_start_pose = None
+        loop._last_command = (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
+        loop._last_target_wrench = np.zeros(6)
+        loop._active_revision = 1
+        loop._executed_in_revision = 0
+        loop.action_period = 1.0 / 30.0
+        loop.period = 1.0 / 60.0
+        loop.camera_to_aubo_base = np.eye(4)
+        return loop
+
+    def test_new_prediction_replaces_only_at_action_boundary(self):
+        loop = self.make_buffer_only_loop()
+        old = action_trajectory(1, [0, 0, 0])[0]
+        new = old.copy()
+        new[0] = 0.2
+        loop._current = ("position", old)
+        loop._current_started = 0.0
+        loop._current_start_pose = (
+            np.zeros(3),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            np.zeros(6),
+        )
+        loop._replacement = (2, deque([("position", new)]))
+
+        loop._next_target(0.01, np.eye(4))
+        self.assertEqual(loop._active_revision, 1)
+        self.assertIsNotNone(loop._replacement)
+
+        loop._current = None
+        loop._next_target(0.02, np.eye(4))
+        self.assertEqual(loop._active_revision, 2)
+        self.assertIsNone(loop._replacement)
+
+    def test_exhausted_prediction_holds_last_successful_pose(self):
+        loop = self.make_buffer_only_loop()
+        loop._last_command = (
+            np.array([0.1, 0.2, 0.3]),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+        )
+
+        mode, position, quat, wrench, completed = loop._next_target(0.0, np.eye(4))
+
+        self.assertEqual(mode, "position")
+        np.testing.assert_array_equal(position, [0.1, 0.2, 0.3])
+        np.testing.assert_array_equal(quat, [0, 0, 0, 1])
+        np.testing.assert_array_equal(wrench, np.zeros(6))
+        self.assertFalse(completed)
+
+    def test_rejected_servo_frame_does_not_update_last_command(self):
+        loop = self.make_buffer_only_loop()
+        old_position = loop._last_command[0].copy()
+
+        loop._commit_servo_result(
+            False,
+            np.ones(3),
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            True,
+            np.zeros(6),
+        )
+
+        np.testing.assert_array_equal(loop._last_command[0], old_position)
+        self.assertEqual(loop._executed_in_revision, 0)
+
+
+class TestLatestWrenchCache(unittest.TestCase):
+    class Sensor:
+        def read(self):
+            return np.arange(6, dtype=np.float64)
+
+    class Compensator:
+        def compensate(self, wrench, quaternion):
+            return np.asarray(wrench) + 1.0
+
+    def test_cache_returns_latest_compensated_sample(self):
+        cache = LatestWrenchCache(
+            self.Sensor(),
+            self.Compensator(),
+            RuntimeStatistics(),
+            sample_rate_hz=250,
+            max_age_s=0.02,
+        )
+        cache.start()
+        try:
+            np.testing.assert_array_equal(
+                cache.read([0, 0, 0, 1]),
+                np.arange(6, dtype=np.float64) + 1.0,
+            )
+        finally:
+            cache.close()
+
+    def test_stale_cache_is_rejected(self):
+        cache = LatestWrenchCache(
+            self.Sensor(),
+            self.Compensator(),
+            RuntimeStatistics(),
+            sample_rate_hz=250,
+            max_age_s=0.001,
+        )
+        cache._sample = np.zeros(6)
+        cache._timestamp = time.monotonic() - 1.0
+
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            cache.read([0, 0, 0, 1])
+
+    def test_startup_recovers_after_more_than_three_protocol_timeouts(self):
+        class StartupSensor:
+            def __init__(self):
+                self.calls = 0
+
+            def read(self):
+                self.calls += 1
+                if self.calls <= 5:
+                    raise XjcProtocolError("waiting for streaming header")
+                return np.arange(6, dtype=np.float64)
+
+        sensor = StartupSensor()
+        statistics = RuntimeStatistics()
+        cache = LatestWrenchCache(
+            sensor,
+            self.Compensator(),
+            statistics,
+            sample_rate_hz=250,
+            max_age_s=0.02,
+            read_retries=3,
+        )
+        cache.start(startup_timeout_s=0.2)
+        try:
+            self.assertGreater(sensor.calls, 3)
+            self.assertEqual(statistics.snapshot()["xjc_read_errors"], 5)
+            np.testing.assert_array_equal(
+                cache.read([0, 0, 0, 1]),
+                np.arange(6, dtype=np.float64) + 1.0,
+            )
+        finally:
+            cache.close()
+
+    def test_missing_stream_fails_on_overall_startup_timeout(self):
+        class MissingStreamSensor:
+            def read(self):
+                raise XjcProtocolError("waiting for streaming header")
+
+        cache = LatestWrenchCache(
+            MissingStreamSensor(),
+            self.Compensator(),
+            RuntimeStatistics(),
+            sample_rate_hz=250,
+            max_age_s=0.02,
+        )
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Timed out waiting for the first XJC sample",
+            ):
+                cache.start(startup_timeout_s=0.02)
+        finally:
+            cache.close()
+
+
+class TestDeploymentConfiguration(unittest.TestCase):
+    def make_args(self, **overrides):
+        values = {
+            "hold_seconds": 0.0,
+            "execute": False,
+            "prepare": False,
+            "recorded_actions": False,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_approved_one_hundred_hz_baseline_is_valid(self):
+        config = load_json("configs/deploy_aubo.json")
+        self.assertEqual(validate_deployment_config(config, self.make_args()), 0.0)
+        self.assertEqual(config["execution"]["control_rate_hz"], 100)
+        self.assertEqual(config["execution"]["control_mode"], "force_position")
+        self.assertEqual(config["execution"]["position_command"], "send_command")
+        self.assertEqual(config["controller_config"], "configs/aubo_admit_hybrid.json")
+        self.assertNotIn("servo_duration_s", config["execution"])
+        self.assertEqual(config["execution"]["position_step_m"], 0.0012)
+        self.assertEqual(config["execution"]["rotation_step_rad"], 0.0012)
+        loop = SingleServoControlLoop(
+            robot=object(),
+            wrench_reader=None,
+            controller=None,
+            camera_to_aubo_base=np.eye(4),
+            config=config["execution"],
+            robot_lock=threading.RLock(),
+            statistics=RuntimeStatistics(),
+        )
+        self.assertAlmostEqual(loop.period, 0.01)
+        self.assertAlmostEqual(loop.duration, loop.period)
+
+    def test_hold_requires_execute_and_rejects_prepare(self):
+        config = load_json("configs/deploy_aubo.json")
+        with self.assertRaisesRegex(RuntimeError, "requires --execute"):
+            validate_deployment_config(
+                config,
+                self.make_args(hold_seconds=30.0),
+            )
+        with self.assertRaisesRegex(RuntimeError, "cannot be combined"):
+            validate_deployment_config(
+                config,
+                self.make_args(hold_seconds=30.0, execute=True, prepare=True),
+            )
+
+    def test_theoretical_tcp_speed_is_checked_before_hardware(self):
+        config = load_json("configs/deploy_aubo.json")
+        config["execution"]["position_step_m"] = 0.01
+
+        with self.assertRaisesRegex(ValueError, "above max_tcp_speed"):
+            validate_deployment_config(config, self.make_args())
+
+    def test_non_contact_profile_is_faster_than_contact_profile(self):
+        controller = make_controller("configs/aubo_admit_hybrid.json")
+        kwargs = {
+            "current_position_base": np.zeros(3),
+            "current_quat_xyzw_base": [0.0, 0.0, 0.0, 1.0],
+            "target_position_base": [0.1, 0.0, 0.0],
+            "target_quat_xyzw_base": [0.0, 0.0, 0.0, 1.0],
+            "measured_wrench_tcp": np.zeros(6),
+            "desired_wrench_tcp": np.zeros(6),
+            "dt": 0.01,
+        }
+        position_command, _ = controller.step(
+            **kwargs,
+            limit_profile="position",
+        )
+        controller.reset()
+        hybrid_command, _ = controller.step(
+            **kwargs,
+            limit_profile="hybrid",
+        )
+        self.assertGreater(position_command[0], hybrid_command[0])
+
 
 class TestXjcInitialization(unittest.TestCase):
     class FakeSensor:
         def __init__(self):
             self.calls = []
+            self.timeout_s = 0.006
+
+        def disable_streaming(self):
+            self.calls.append("disable_streaming")
 
         def set_zero(self):
             self.calls.append("set_zero")
+
+        def read_polling(self):
+            self.calls.append("read_polling")
+            return np.zeros(6)
 
         def enable_streaming(self):
             self.calls.append("enable_streaming")
@@ -282,7 +901,18 @@ class TestXjcInitialization(unittest.TestCase):
             },
         )
 
-        self.assertEqual(sensor.calls, ["set_zero", "enable_streaming"])
+        self.assertEqual(
+            sensor.calls,
+            [
+                "disable_streaming",
+                "disable_streaming",
+                "disable_streaming",
+                "read_polling",
+                "read_polling",
+                "read_polling",
+                "enable_streaming",
+            ],
+        )
 
     def test_zero_can_be_explicitly_disabled_for_read_only_diagnosis(self):
         sensor = self.FakeSensor()
@@ -297,6 +927,51 @@ class TestXjcInitialization(unittest.TestCase):
         )
 
         self.assertEqual(sensor.calls, ["enable_streaming"])
+
+    def test_zero_retries_and_restores_realtime_timeout(self):
+        class RetrySensor(self.FakeSensor):
+            def __init__(self):
+                super().__init__()
+                self.zeroed = False
+
+            def set_zero(self):
+                self.calls.append("set_zero")
+                self.zeroed = True
+
+            def read_polling(self):
+                self.calls.append("read_polling")
+                return np.zeros(6) if self.zeroed else np.ones(6)
+
+        sensor = RetrySensor()
+        initialize_xjc_sensor(
+            sensor,
+            {
+                "zero_on_startup": True,
+                "zero_prepare_seconds": 0.0,
+                "zero_response_timeout_s": 0.1,
+                "zero_retries": 2,
+                "zero_retry_delay_s": 0.0,
+                "zero_initial_disable_count": 1,
+                "zero_retry_disable_count": 1,
+                "zero_polling_count": 1,
+                "zero_command_count": 2,
+                "zero_settle_seconds": 0.0,
+                "streaming": False,
+            },
+        )
+
+        self.assertEqual(
+            sensor.calls,
+            [
+                "disable_streaming",
+                "read_polling",
+                "disable_streaming",
+                "set_zero",
+                "set_zero",
+                "read_polling",
+            ],
+        )
+        self.assertEqual(sensor.timeout_s, 0.006)
 
 
 class TestAuboActionExecutorSafety(unittest.TestCase):

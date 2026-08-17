@@ -119,6 +119,7 @@ def main():
         slave_address=config.get("slave_address", 1),
         sample_rate=config.get("sample_rate", 250),
         usb_selector=config.get("usb_selector"),
+        transport=config.get("transport"),
     ) as sensor:
         summary = capture(
             sensor,

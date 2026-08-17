@@ -129,10 +129,6 @@ def main():
         username=robot_config.get("username", "aubo"),
         password=password,
         request_timeout_ms=robot_config.get("request_timeout_ms", 1000),
-        max_joint_step_rad=robot_config.get(
-            "max_joint_step_rad",
-            np.deg2rad(0.1),
-        ),
     ) as robot:
         summary = collect_readonly_state(
             robot,

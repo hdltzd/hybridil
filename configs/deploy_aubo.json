@@ -1,18 +1,40 @@
 {
+    "_说明": "AUBO C5、D455和XJC的实时HybridIL部署配置。所有长度单位为米，角度单位为弧度，时间单位为秒，频率单位为Hz。以_开头的说明字段只供阅读，程序不会使用。",
     "name": "hybridil_aubo",
     "seed": 1,
     "source": {
-        "mode": "replay",
+        "_说明": {
+            "mode": "live表示使用D455、AUBO和XJC实时观测；replay表示从HDF5离线回放，回放模式禁止实机运动。",
+            "hdf5_path": "仅replay模式使用的HDF5数据文件。",
+            "demo": "仅replay模式使用的数据组名称。",
+            "start_index": "回放的起始帧索引。",
+            "max_policy_calls": "命令行未提供--max-policy-calls时采用的策略调用次数。"
+        },
+        "mode": "live",
         "hdf5_path": "peel_data/v2.0.hdf5",
         "demo": "demo_0",
         "start_index": 0,
         "max_policy_calls": 1
     },
     "inference": {
+        "_说明": {
+            "endpoint": "node.py策略服务器的ZeroMQ地址。当前同一台电脑运行，因此使用127.0.0.1。",
+            "timeout_ms": "一次观测发送和动作接收允许的最长等待时间，单位毫秒。",
+            "protocol": "numpy使用多帧NumPy二进制传输点云，减少JSON序列化造成的CPU占用；node.py仍兼容原JSON协议。"
+        },
         "endpoint": "tcp://127.0.0.1:12345",
-        "timeout_ms": 120000
+        "timeout_ms": 120000,
+        "protocol": "numpy"
     },
     "policy": {
+        "_说明": {
+            "obs_horizon": "模型一次使用的历史观测帧数，必须与训练checkpoint一致。",
+            "act_horizon": "每次预测实际接收和执行的动作步数，当前模型为10步。",
+            "point_count": "送入模型的点云点数，必须与训练配置一致。",
+            "voxel_size": "点云体素降采样边长，单位米；改变会影响点云密度和模型输入分布。",
+            "force_threshold": "预测力模长超过该阈值时判定为接触候选，单位N。",
+            "force_ratio": "一个动作块中高力动作比例超过该值后进入力位混合阶段。"
+        },
         "obs_horizon": 1,
         "act_horizon": 10,
         "point_count": 10000,
@@ -21,6 +43,14 @@
         "force_ratio": 0.2
     },
     "camera": {
+        "_说明": {
+            "serial": "D455序列号；null表示使用检测到的第一台D455，多相机系统应填写明确序列号。",
+            "depth_size": "深度图宽度和高度。",
+            "color_size": "彩色图宽度和高度。",
+            "fps": "D455采集频率。",
+            "timeout_ms": "等待一组对齐彩色/深度帧的超时时间，单位毫秒。",
+            "warmup_frames": "启动时丢弃的预热帧数。"
+        },
         "serial": null,
         "depth_size": [1280, 720],
         "color_size": [1280, 720],
@@ -29,30 +59,97 @@
         "warmup_frames": 20
     },
     "coordinates": {
-        "calibrated": false
+        "_说明": "calibrated=true表示pose.py中的D455_2_BASE和BASEr_2_BASE已经完成实机标定；未标定时禁止发送实机运动命令。",
+        "calibrated": true
     },
     "robot": {
+        "_说明": {
+            "ip": "AUBO RPC服务器地址；控制柜工控机本地运行RPC服务时使用127.0.0.1。",
+            "rpc_port": "AUBO SDK RPC端口。",
+            "username": "AUBO RPC登录用户名。",
+            "password": "AUBO RPC登录密码；配置文件可能被共享时应改用password_env。",
+            "password_env": "password为空时读取密码的环境变量名称。",
+            "robot_name": "机器人名称；null表示选择控制器返回的第一台机器人。",
+            "request_timeout_ms": "AUBO RPC请求超时时间，单位毫秒。",
+            "allow_motion": "实机运动配置锁；只有true并且命令行带--execute才会发送运动命令。"
+        },
         "ip": "127.0.0.1",
         "rpc_port": 30004,
         "username": "aubo",
-        "password": null,
+        "password": "jsfb",
         "password_env": "AUBO_PASSWORD",
         "robot_name": null,
         "request_timeout_ms": 1000,
-        "max_joint_step_rad": 0.0017453292519943296,
-        "allow_motion": false
+        "allow_motion": true
     },
+    "_force_sensor_config说明": "XJC六维力传感器的串口、清零和坐标参数保存在该文件；当前位置控制只把XJC作为模型观测。",
     "force_sensor_config": "configs/xjc_ft.json",
     "controller_config": "configs/aubo_admit_hybrid.json",
+    "preparation": {
+        "_说明": {
+            "enabled": "是否允许使用--prepare准备阶段。",
+            "init_joint_waypoints_rad": "准备阶段低速MoveJ依次经过的关节路点，每个路点6个关节角。",
+            "movej_max_velocity_rad_s": "准备阶段MoveJ最大关节速度。",
+            "movej_max_acceleration_rad_s2": "准备阶段MoveJ最大关节加速度。",
+            "movej_timeout_s": "每个MoveJ路点的最长等待时间。",
+            "movej_tolerance_rad": "判断关节路点到达的允许误差。",
+            "move_to_policy_ready": "到达初始化关节构型后，是否根据策略第一目标生成无接触预备位姿。",
+            "tool_forward_axis": "工具前进方向在TCP坐标系中是+Z还是-Z。",
+            "retreat_distance_m": "策略目标沿工具前进方向反向退让的无接触距离。"
+        },
+        "enabled": true,
+        "init_joint_waypoints_rad": [
+            [1.5707963268, 1.2217304764, 2.2689280276, 0.0, 1.5707963268, 0.0]
+        ],
+        "movej_max_velocity_rad_s": 0.7,
+        "movej_max_acceleration_rad_s2": 0.2,
+        "movej_timeout_s": 60.0,
+        "movej_tolerance_rad": 0.005,
+        "move_to_policy_ready": true,
+        "tool_forward_axis": "+z",
+        "retreat_distance_m": 0.08
+    },
     "execution": {
-        "control_rate_hz": 125,
+        "_说明": {
+            "control_mode": "force_position表示非接触阶段使用零期望力的导纳位置控制，接触阶段使用模型预测力的力位混合控制。",
+            "position_command": "send_command表示启动前连续检查10步名义IK，实时控制再以上一次成功关节解为种子在线IK，并通过AUBO参考接口发送；MoveJ仅用于准备阶段。",
+            "control_rate_hz": "send_command底层servoJoint的发送和关节插值频率；命令持续时间自动计算为1/control_rate_hz。",
+            "action_rate_hz": "模型轨迹动作频率，决定每个预测动作持续1/action_rate_hz秒；应与训练/采集时间语义一致，不能随Servo频率任意修改。",
+            "control_timeout_s": "控制周期明显延迟的日志警告阈值；偶发超时只警告，不立即停止。",
+            "servo_lookahead_s": "AUBO ServoJ平滑预测时间；增大更平滑但滞后更大，减小响应更快但可能抖动。",
+            "servo_gain": "AUBO ServoJ目标跟踪增益；增大跟随更紧但可能增加抖动，通常保持参考值200。",
+            "position_step_m": "每个Servo周期允许的最大TCP平移步长。实际步长=min(position_step_m, max_tcp_speed_m_s/control_rate_hz)。",
+            "rotation_step_rad": "每个Servo周期允许的最大TCP旋转步长。实际步长=min(rotation_step_rad, max_tcp_angular_speed_rad_s/control_rate_hz)。",
+            "servo_queue_full_max_consecutive": "AUBO连续返回code 2队列满达到该次数后停止；偶发队列满只丢弃当前帧。",
+            "max_tcp_speed_m_s": "TCP平移速度上限。若希望position_step_m完全生效，应满足position_step_m*control_rate_hz不大于该值。",
+            "max_tcp_angular_speed_rad_s": "TCP角速度上限。若希望rotation_step_rad完全生效，应满足rotation_step_rad*control_rate_hz不大于该值。",
+            "xjc_max_sample_age_s": "XJC实时样本新鲜度阈值；导纳位置和力位混合阶段都要求力反馈不超过该年龄。",
+            "workspace_bounds_aubo_base": "AUBO基座坐标系下TCP允许范围，依次为X、Y、Z的最小值和最大值。",
+            "prefetch_after_actions": "执行到该模型关节路点后采集新观测，并在继续旧动作时并行推理下一块。"
+        },
+        "_参数关系": [
+            "Servo周期=1/control_rate_hz；程序自动把servoJoint持续时间设为该周期，不再单独配置servo_duration_s。",
+            "模型动作周期=1/action_rate_hz；100Hz Servo和30Hz动作意味着每个模型动作约由3到4个Servo目标插值完成。",
+            "实际平移步长=min(position_step_m, max_tcp_speed_m_s/control_rate_hz)。",
+            "实际旋转步长=min(rotation_step_rad, max_tcp_angular_speed_rad_s/control_rate_hz)。",
+            "当前参数0.0012米*100Hz=0.12米每秒，0.0012弧度*100Hz=0.12弧度每秒，与此前60Hz下0.002步长的运动速度等效。",
+            "当前act_horizon为10且prefetch_after_actions为5，因此执行前5步后开始下一次推理。",
+            "启动前连续求解10步名义IK；实时柔顺修正后每周期继续以上一次成功关节解为种子在线IK。执行到第5步开始下一次推理，旧10步和新10步都完整保留。"
+        ],
+        "control_mode": "force_position",
+        "position_command": "send_command",
+        "control_rate_hz": 100,
         "action_rate_hz": 30,
-        "control_timeout_s": 0.02,
-        "servo_duration_s": 0.008,
+        "control_timeout_s": 0.1,
         "servo_lookahead_s": 0.1,
         "servo_gain": 200.0,
-        "position_step_m": 0.0001,
-        "rotation_step_rad": 0.001,
-        "workspace_bounds_aubo_base": [[-0.8, 0.8], [-0.8, 0.8], [0.05, 1.2]]
+        "position_step_m": 0.0012,
+        "rotation_step_rad": 0.0012,
+        "servo_queue_full_max_consecutive": 5,
+        "max_tcp_speed_m_s": 0.12,
+        "max_tcp_angular_speed_rad_s": 0.12,
+        "xjc_max_sample_age_s": 0.1,
+        "prefetch_after_actions": 5,
+        "workspace_bounds_aubo_base": [[-1, 1], [-1, 1], [-1.2, 1.2]]
     }
 }

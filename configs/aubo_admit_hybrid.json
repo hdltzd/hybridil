@@ -1,8 +1,15 @@
 {
-    "control_rate_hz": 125,
+    "_说明": {
+        "position_limits": "非接触导纳位置阶段使用，允许较快接近模型目标。",
+        "hybrid_limits": "max_acceleration、max_velocity和max_pose_step用于接触力位混合阶段，继续保持低速。",
+        "max_pose_step": "每个100Hz周期的最大变化量，前三项单位m，后三项单位rad。"
+    },
     "mass": [2.0, 2.0, 2.0, 0.1, 0.1, 0.1],
-    "stiffness": [2500.0, 2500.0, 400.0, 5.0, 5.0, 5.0],
+    "stiffness": [1000.0, 1000.0, 100.0, 5.0, 5.0, 5.0],
     "damping": [20.0, 20.0, 15.0, 0.1, 0.1, 0.1],
+    "position_max_acceleration": [1.2, 1.2, 1.2, 1.5, 1.5, 1.5],
+    "position_max_velocity": [0.08, 0.08, 0.08, 0.15, 0.15, 0.15],
+    "position_max_pose_step": [0.0008, 0.0008, 0.0008, 0.0015, 0.0015, 0.0015],
     "max_acceleration": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
     "max_velocity": [0.01, 0.01, 0.01, 0.05, 0.05, 0.05],
     "max_pose_step": [0.0001, 0.0001, 0.0001, 0.001, 0.001, 0.001],

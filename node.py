@@ -8,6 +8,10 @@ import zmq
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
 from robomimic.algo import RolloutPolicy
+from deployment.aubo_hybridil import (
+    decode_numpy_request,
+    encode_numpy_response,
+)
 
 
 def main(cfg):
@@ -33,14 +37,18 @@ def main(cfg):
     socket.bind(f"tcp://*:{port}")
     while True:
         print('========================       wating for obs data...       ========================')
-        data_json = socket.recv_string()
+        request_parts = socket.recv_multipart()
         print("======================== received data, start processing... ========================")
-        data = json.loads(data_json)
-        name = data["name"]
-        pointcloud = np.array(data["pointcloud"])
-        robot0_eef_pos = np.array(data["robot0_eef_pos"])
-        robot0_eef_quat = np.array(data["robot0_eef_quat"])
-        robot0_eef_wrench = np.array(data["robot0_eef_wrench"])
+        numpy_protocol = len(request_parts) > 1
+        if numpy_protocol:
+            name, data = decode_numpy_request(request_parts)
+        else:
+            data = json.loads(request_parts[0].decode("utf-8"))
+            name = data["name"]
+        pointcloud = np.asarray(data["pointcloud"])
+        robot0_eef_pos = np.asarray(data["robot0_eef_pos"])
+        robot0_eef_quat = np.asarray(data["robot0_eef_quat"])
+        robot0_eef_wrench = np.asarray(data["robot0_eef_wrench"])
         obs = dict(pointcloud=pointcloud,
                    robot0_eef_pos=robot0_eef_pos,
                    robot0_eef_quat=robot0_eef_quat,
@@ -50,12 +58,14 @@ def main(cfg):
         print("========================       inference time: {}           ========================".format(time.time() - t0))
         act_seq = np.array(act_seq)
         print("========================  process done, send data back...   ========================")
-        output_data = {
-            "name": name,
-            "action": act_seq.tolist()
-        }
-        output_data_json = json.dumps(output_data)
-        socket.send_string(output_data_json)
+        if numpy_protocol:
+            socket.send_multipart(encode_numpy_response(name, act_seq))
+        else:
+            output_data = {
+                "name": name,
+                "action": act_seq.tolist()
+            }
+            socket.send_string(json.dumps(output_data))
         print("========================        send data back done          ========================")
         print(" ")
         print(" ")

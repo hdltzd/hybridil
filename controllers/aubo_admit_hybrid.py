@@ -85,6 +85,9 @@ class AuboAdmitHybridController:
         max_pose_step: Sequence[float],
         max_force: float,
         max_torque: float,
+        position_max_acceleration: Sequence[float] = None,
+        position_max_velocity: Sequence[float] = None,
+        position_max_pose_step: Sequence[float] = None,
         torque_admittance_threshold: float = 0.1,
         contact_force_z: float = -3.0,
         force_integral_gain: float = 0.5,
@@ -104,6 +107,29 @@ class AuboAdmitHybridController:
             raise ValueError("acceleration and velocity limits must be positive")
         if np.any(self.max_pose_step <= 0):
             raise ValueError("pose step limits must be positive")
+        self.position_max_acceleration = _vector(
+            max_acceleration
+            if position_max_acceleration is None
+            else position_max_acceleration,
+            6,
+            "position_max_acceleration",
+        )
+        self.position_max_velocity = _vector(
+            max_velocity if position_max_velocity is None else position_max_velocity,
+            6,
+            "position_max_velocity",
+        )
+        self.position_max_pose_step = _vector(
+            max_pose_step if position_max_pose_step is None else position_max_pose_step,
+            6,
+            "position_max_pose_step",
+        )
+        if np.any(self.position_max_acceleration <= 0) or np.any(
+            self.position_max_velocity <= 0
+        ):
+            raise ValueError("position acceleration and velocity limits must be positive")
+        if np.any(self.position_max_pose_step <= 0):
+            raise ValueError("position pose step limits must be positive")
         if min(max_force, max_torque, torque_admittance_threshold) <= 0:
             raise ValueError("force, torque, and threshold limits must be positive")
         if integral_window <= 0:
@@ -151,6 +177,7 @@ class AuboAdmitHybridController:
         measured_wrench_tcp: Sequence[float],
         desired_wrench_tcp: Sequence[float],
         dt: float,
+        limit_profile: str = "hybrid",
     ) -> Tuple[np.ndarray, np.ndarray]:
         if not np.isfinite(dt) or dt <= 0 or dt > 0.1:
             raise ValueError("dt must be in (0, 0.1] seconds")
@@ -160,6 +187,16 @@ class AuboAdmitHybridController:
         target_quat = _vector(target_quat_xyzw_base, 4, "target quaternion")
         measured_wrench = self.validate_measured_wrench(measured_wrench_tcp)
         desired_wrench = _vector(desired_wrench_tcp, 6, "desired_wrench")
+        if limit_profile == "position":
+            acceleration_limit = self.position_max_acceleration
+            velocity_limit = self.position_max_velocity
+            pose_step_limit = self.position_max_pose_step
+        elif limit_profile == "hybrid":
+            acceleration_limit = self.max_acceleration
+            velocity_limit = self.max_velocity
+            pose_step_limit = self.max_pose_step
+        else:
+            raise ValueError("limit_profile must be position or hybrid")
 
         current_rotation = Rot.from_quat(current_quat).as_matrix()
         target_rotation = Rot.from_quat(target_quat).as_matrix()
@@ -195,15 +232,15 @@ class AuboAdmitHybridController:
             - self.damping * self.desired_twist_tcp
             + self.stiffness * pose_error_tcp
         )
-        acceleration = self._clip(acceleration, self.max_acceleration)
+        acceleration = self._clip(acceleration, acceleration_limit)
         self.desired_twist_tcp += acceleration * dt
         self.desired_twist_tcp = self._clip(
             self.desired_twist_tcp,
-            self.max_velocity,
+            velocity_limit,
         )
         delta_pose_tcp = self._clip(
             self.desired_twist_tcp * dt,
-            self.max_pose_step,
+            pose_step_limit,
         )
 
         command_position = current_position + current_rotation @ delta_pose_tcp[:3]

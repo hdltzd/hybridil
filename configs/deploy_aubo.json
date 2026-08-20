@@ -39,7 +39,7 @@
         "act_horizon": 10,
         "point_count": 10000,
         "voxel_size": 0.001,
-        "force_threshold": 6.0,
+        "force_threshold": 1.0,
         "force_ratio": 0.2
     },
     "camera": {
@@ -82,7 +82,7 @@
         "request_timeout_ms": 1000,
         "allow_motion": true
     },
-    "_force_sensor_config说明": "XJC六维力传感器的串口、清零和坐标参数保存在该文件；当前位置控制只把XJC作为模型观测。",
+    "_force_sensor_config说明": "XJC六维力传感器的串口、清零和坐标参数保存在该文件；当前纯位置控制只把XJC作为模型观测，不把它用于命令修正。",
     "force_sensor_config": "configs/xjc_ft.json",
     "controller_config": "configs/aubo_admit_hybrid.json",
     "preparation": {
@@ -101,7 +101,7 @@
         "init_joint_waypoints_rad": [
             [1.5707963268, 1.2217304764, 2.2689280276, 0.0, 1.5707963268, 0.0]
         ],
-        "movej_max_velocity_rad_s": 0.7,
+        "movej_max_velocity_rad_s": 0.5,
         "movej_max_acceleration_rad_s2": 0.2,
         "movej_timeout_s": 60.0,
         "movej_tolerance_rad": 0.005,
@@ -111,45 +111,36 @@
     },
     "execution": {
         "_说明": {
-            "control_mode": "force_position表示非接触阶段使用零期望力的导纳位置控制，接触阶段使用模型预测力的力位混合控制。",
-            "position_command": "send_command表示启动前连续检查10步名义IK，实时控制再以上一次成功关节解为种子在线IK，并通过AUBO参考接口发送；MoveJ仅用于准备阶段。",
-            "control_rate_hz": "send_command底层servoJoint的发送和关节插值频率；命令持续时间自动计算为1/control_rate_hz。",
-            "action_rate_hz": "模型轨迹动作频率，决定每个预测动作持续1/action_rate_hz秒；应与训练/采集时间语义一致，不能随Servo频率任意修改。",
+            "control_mode": "当前部署仅支持position纯位置控制：模型TCP位姿先连续求解为关节路点，再发送AUBO ServoJ；XJC仅作为模型观测。后续重新接入力位混合时再扩展force_position。",
+            "position_command": "send_command表示启动Servo前连续求解10步名义IK；运行时单一Servo线程只插值关节路点并通过AUBO参考接口发送，不在线求IK。MoveJ仅用于准备阶段。",
+            "control_rate_hz": "唯一Servo控制线程的固定频率；每个周期插值一个关节目标并发送一次servoJoint，命令持续时间自动计算为1/control_rate_hz。",
+            "trajectory_duration_s": "一次模型输出的全部10个动作点的总执行时间；程序自动生成原AUBO move_to_point(t, pose)所需的累计到达时间t。",
             "control_timeout_s": "控制周期明显延迟的日志警告阈值；偶发超时只警告，不立即停止。",
             "servo_lookahead_s": "AUBO ServoJ平滑预测时间；增大更平滑但滞后更大，减小响应更快但可能抖动。",
             "servo_gain": "AUBO ServoJ目标跟踪增益；增大跟随更紧但可能增加抖动，通常保持参考值200。",
-            "position_step_m": "每个Servo周期允许的最大TCP平移步长。实际步长=min(position_step_m, max_tcp_speed_m_s/control_rate_hz)。",
-            "rotation_step_rad": "每个Servo周期允许的最大TCP旋转步长。实际步长=min(rotation_step_rad, max_tcp_angular_speed_rad_s/control_rate_hz)。",
             "servo_queue_full_max_consecutive": "AUBO连续返回code 2队列满达到该次数后停止；偶发队列满只丢弃当前帧。",
-            "max_tcp_speed_m_s": "TCP平移速度上限。若希望position_step_m完全生效，应满足position_step_m*control_rate_hz不大于该值。",
-            "max_tcp_angular_speed_rad_s": "TCP角速度上限。若希望rotation_step_rad完全生效，应满足rotation_step_rad*control_rate_hz不大于该值。",
-            "xjc_max_sample_age_s": "XJC实时样本新鲜度阈值；导纳位置和力位混合阶段都要求力反馈不超过该年龄。",
+            "xjc_max_sample_age_s": "仅在未来启用force_position导纳/力位混合时使用的XJC实时样本新鲜度阈值；纯位置控制不以它停止Servo。",
             "workspace_bounds_aubo_base": "AUBO基座坐标系下TCP允许范围，依次为X、Y、Z的最小值和最大值。",
-            "prefetch_after_actions": "执行到该模型关节路点后采集新观测，并在继续旧动作时并行推理下一块。"
+            "trajectory_execution": "move_to_point：一次策略输出的10个TCP点先连续求解为10个关节路点；唯一Servo线程按control_rate_hz直接进行关节插值并发送。10点结束后才重新观测和推理下一块。"
         },
         "_参数关系": [
             "Servo周期=1/control_rate_hz；程序自动把servoJoint持续时间设为该周期，不再单独配置servo_duration_s。",
-            "模型动作周期=1/action_rate_hz；100Hz Servo和30Hz动作意味着每个模型动作约由3到4个Servo目标插值完成。",
-            "实际平移步长=min(position_step_m, max_tcp_speed_m_s/control_rate_hz)。",
-            "实际旋转步长=min(rotation_step_rad, max_tcp_angular_speed_rad_s/control_rate_hz)。",
-            "当前参数0.0012米*100Hz=0.12米每秒，0.0012弧度*100Hz=0.12弧度每秒，与此前60Hz下0.002步长的运动速度等效。",
-            "当前act_horizon为10且prefetch_after_actions为5，因此执行前5步后开始下一次推理。",
-            "启动前连续求解10步名义IK；实时柔顺修正后每周期继续以上一次成功关节解为种子在线IK。执行到第5步开始下一次推理，旧10步和新10步都完整保留。"
+            "10点轨迹时间由trajectory_duration_s决定；例如0.5秒时，每点相隔约50毫秒。",
+            "不再配置position_step_m或rotation_step_rad，也不限制10个预测点之间的位姿差值。",
+            "当前纯位置轨迹不再做每周期TCP速度/角速度裁剪；仍保留工作空间、IK、AUBO自身碰撞保护和急停。",
+            "当前act_horizon为10、trajectory_duration_s为20秒：每轮完整执行10点后，才采集新观测并开始下一次推理；推理期间Servo线程保持最后成功关节位姿。",
+            "启动每个动作块前连续求解10步名义IK；运行时每周期仅对相邻关节路点线性插值后发送ServoJ。",
+            "当前control_mode=position：无论模型预测力是否超过force_threshold，都不会进入软件导纳或力位混合控制。"
         ],
-        "control_mode": "force_position",
+        "control_mode": "position",
         "position_command": "send_command",
         "control_rate_hz": 100,
-        "action_rate_hz": 30,
+        "trajectory_duration_s": 10,
         "control_timeout_s": 0.1,
-        "servo_lookahead_s": 0.1,
+        "servo_lookahead_s": 0.05,
         "servo_gain": 200.0,
-        "position_step_m": 0.0012,
-        "rotation_step_rad": 0.0012,
         "servo_queue_full_max_consecutive": 5,
-        "max_tcp_speed_m_s": 0.12,
-        "max_tcp_angular_speed_rad_s": 0.12,
         "xjc_max_sample_age_s": 0.1,
-        "prefetch_after_actions": 5,
         "workspace_bounds_aubo_base": [[-1, 1], [-1, 1], [-1.2, 1.2]]
     }
 }

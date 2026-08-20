@@ -54,12 +54,10 @@ def make_controller(path: str) -> AuboAdmitHybridController:
         damping=config["damping"],
         max_acceleration=config["max_acceleration"],
         max_velocity=config["max_velocity"],
-        max_pose_step=config["max_pose_step"],
         max_force=config["max_force"],
         max_torque=config["max_torque"],
         position_max_acceleration=config.get("position_max_acceleration"),
         position_max_velocity=config.get("position_max_velocity"),
-        position_max_pose_step=config.get("position_max_pose_step"),
         torque_admittance_threshold=config.get("torque_admittance_threshold", 0.1),
         contact_force_z=config.get("contact_force_z", -3.0),
         force_integral_gain=config.get("force_integral_gain", 0.5),
@@ -340,14 +338,10 @@ class AuboActionExecutor:
             "CAMERA_2_AUBO_BASE",
         )
         control_rate = float(config["control_rate_hz"])
-        action_rate = float(config["action_rate_hz"])
-        if not np.isfinite([control_rate, action_rate]).all() or min(
-            control_rate,
-            action_rate,
-        ) <= 0:
-            raise ValueError("control_rate_hz and action_rate_hz must be positive")
+        if not np.isfinite(control_rate) or control_rate <= 0:
+            raise ValueError("control_rate_hz must be positive")
         self.control_period = 1.0 / control_rate
-        self.action_period = 1.0 / action_rate
+        self.trajectory_duration = float(config["trajectory_duration_s"])
         self.control_timeout = float(config.get("control_timeout_s", 0.02))
         if (
             not np.isfinite(self.control_timeout)
@@ -357,8 +351,8 @@ class AuboActionExecutor:
         self.servo_duration = self.control_period
         self.servo_lookahead = float(config.get("servo_lookahead_s", 0.1))
         self.servo_gain = float(config.get("servo_gain", 200.0))
-        self.position_step = float(config.get("position_step_m", 0.002))
-        self.rotation_step = float(config.get("rotation_step_rad", 0.01))
+        self.max_speed = float(config["max_tcp_speed_m_s"])
+        self.max_angular_speed = float(config["max_tcp_angular_speed_rad_s"])
         self.workspace = np.asarray(
             config["workspace_bounds_aubo_base"],
             dtype=np.float64,
@@ -379,15 +373,17 @@ class AuboActionExecutor:
     def _bounded_position_command(self, current, target_position, target_quat):
         delta_position = target_position - current[:3, 3]
         distance = float(np.linalg.norm(delta_position))
-        if distance > self.position_step:
-            delta_position *= self.position_step / distance
+        max_position_step = self.max_speed * self.control_period
+        if distance > max_position_step:
+            delta_position *= max_position_step / distance
         command_position = current[:3, 3] + delta_position
 
         target_rotation = Rot.from_quat(target_quat).as_matrix()
         relative = Rot.from_matrix(current[:3, :3].T @ target_rotation).as_rotvec()
         angle = float(np.linalg.norm(relative))
-        if angle > self.rotation_step:
-            relative *= self.rotation_step / angle
+        max_rotation_step = self.max_angular_speed * self.control_period
+        if angle > max_rotation_step:
+            relative *= max_rotation_step / angle
         command_rotation = current[:3, :3] @ Rot.from_rotvec(relative).as_matrix()
         return command_position, Rot.from_matrix(command_rotation).as_quat()
 
@@ -421,13 +417,14 @@ class AuboActionExecutor:
             self.controller.reset()
             self.mode = mode
         previous_cycle_start = None
+        action_period = self.trajectory_duration / len(actions)
         for action in actions:
             target_position, target_quat, wrench_tcp = transform_action_to_aubo_base(
                 action,
                 self.camera_to_aubo_base,
             )
             self._check_target(target_position, wrench_tcp)
-            deadline = time.perf_counter() + self.action_period
+            deadline = time.perf_counter() + action_period
             while True:
                 cycle_start = time.perf_counter()
                 if previous_cycle_start is None:
@@ -777,37 +774,25 @@ def validate_deployment_config(config, args):
         raise RuntimeError("--prepare requires --execute because it moves the AUBO")
 
     execution = config["execution"]
-    if execution.get("control_mode") != "force_position":
-        raise ValueError("当前实时任务必须使用 execution.control_mode=force_position")
+    if execution.get("control_mode") != "position":
+        raise ValueError(
+            "当前单线程关节轨迹执行器仅支持 execution.control_mode=position"
+        )
     position_command = execution.get("position_command", "servo_joint")
     if position_command != "send_command":
         raise ValueError("当前位置控制必须使用 execution.position_command=send_command")
-    if not isinstance(config.get("controller_config"), str):
-        raise ValueError("force_position模式必须配置controller_config")
     numeric_positive = (
         "control_rate_hz",
-        "action_rate_hz",
+        "trajectory_duration_s",
         "control_timeout_s",
         "servo_lookahead_s",
         "servo_gain",
-        "position_step_m",
-        "rotation_step_rad",
-        "max_tcp_speed_m_s",
-        "max_tcp_angular_speed_rad_s",
         "xjc_max_sample_age_s",
     )
     for key in numeric_positive:
         value = float(execution[key])
         if not np.isfinite(value) or value <= 0:
             raise ValueError("execution.{} must be positive and finite".format(key))
-    if float(execution["position_step_m"]) * float(execution["control_rate_hz"]) > float(
-        execution["max_tcp_speed_m_s"]
-    ) + 1e-12:
-        raise ValueError("position_step_m implies a speed above max_tcp_speed_m_s")
-    if float(execution["rotation_step_rad"]) * float(execution["control_rate_hz"]) > float(
-        execution["max_tcp_angular_speed_rad_s"]
-    ) + 1e-12:
-        raise ValueError("rotation_step_rad implies a speed above max_tcp_angular_speed_rad_s")
     if int(execution.get("servo_queue_full_max_consecutive", 5)) <= 0:
         raise ValueError("servo_queue_full_max_consecutive must be positive")
     workspace = np.asarray(execution["workspace_bounds_aubo_base"], dtype=np.float64)
@@ -815,9 +800,6 @@ def validate_deployment_config(config, args):
         workspace[:, 0] >= workspace[:, 1]
     ):
         raise ValueError("workspace_bounds_aubo_base must contain three valid ranges")
-    prefetch_after = int(execution.get("prefetch_after_actions", 5))
-    if prefetch_after <= 0 or prefetch_after > int(config["policy"]["act_horizon"]):
-        raise ValueError("prefetch_after_actions must be within the action horizon")
     protocol = config["inference"].get("protocol", "json")
     if protocol not in ("json", "numpy"):
         raise ValueError("inference.protocol must be json or numpy")
@@ -839,6 +821,16 @@ def plan_segments(planner, actions):
         segments.append((chunk.mode, chunk.actions))
         remaining = remaining[consumed:]
     return segments
+
+
+def move_to_point_times(trajectory_duration_s, point_count):
+    """生成参考AUBO ``move_to_point(t, pose)`` 所需的累计到达时间序列。"""
+    duration = float(trajectory_duration_s)
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError("trajectory_duration_s must be positive and finite")
+    if int(point_count) <= 0:
+        raise ValueError("point_count must be positive")
+    return np.linspace(duration / int(point_count), duration, int(point_count))
 
 
 def print_chunk_summary(call_index, source_index, chunk, camera_to_aubo_base) -> None:
@@ -1111,8 +1103,8 @@ def main() -> None:
         return predict_with_client(inference, observation)
 
     try:
-        if args.execute:
-            controller = make_controller(config["controller_config"])
+        # 当前部署仅采用与原Flexiv非接触阶段一致的纯位置路径：
+        # 模型TCP位姿 -> 启动Servo前连续IK -> 关节插值 -> AUBO ServoJ。
 
         # 保持模式和HDF5动作回放不需要连接模型服务器。
         if not args.recorded_actions and not hold_seconds:
@@ -1202,15 +1194,15 @@ def main() -> None:
                 completed += 1
             return
 
-        if execution["control_mode"] == "force_position":
+        if execution["control_mode"] == "position":
             observation = get_live_observation()
             actions, inference_latency = predict(observation)
             workspace = np.asarray(
                 execution["workspace_bounds_aubo_base"],
                 dtype=np.float64,
             )
-            # 启动运动前连续检查完整10步名义IK；真实导纳修正后的TCP命令
-            # 仍会在每个控制周期以上一次成功关节解为种子在线求IK。
+            # 启动Servo前连续求解完整10步IK。纯位置实时线程只插值这些
+            # 关节路点并发送ServoJ，绝不在每个控制周期重新调用IK RPC。
             with robot_lock:
                 nominal_joints, _ = solve_continuous_joint_targets(
                     robot,
@@ -1222,6 +1214,8 @@ def main() -> None:
             planner = ActionChunkPlanner(
                 force_threshold=float(policy_config["force_threshold"]),
                 force_ratio=float(policy_config["force_ratio"]),
+                # 当前纯位置部署不让预测力改变执行方式。
+                hybrid_force_enabled=False,
             )
             servo_control = SingleServoControlLoop(
                 robot=robot,
@@ -1232,8 +1226,6 @@ def main() -> None:
                 robot_lock=robot_lock,
                 statistics=statistics,
             )
-            servo_control.submit(plan_segments(planner, actions))
-            total_target_actions = len(actions)
             robot.require_motion_allowed()
             robot.enable_servo()
             servo_control.start()
@@ -1242,29 +1234,29 @@ def main() -> None:
             accepted = 1
             current_latency = inference_latency
             current_source_index = 0
-            prefetch_after = int(execution.get("prefetch_after_actions", 5))
             timeout_s = max(
                 5.0,
-                int(policy_config["act_horizon"])
-                / float(execution["action_rate_hz"])
-                + 2.0,
+                float(execution["trajectory_duration_s"]) + 2.0,
+            )
+            revision = servo_control.move_to_point(
+                move_to_point_times(execution["trajectory_duration_s"], len(actions)),
+                plan_segments(planner, actions),
+                joint_waypoints=nominal_joints,
             )
             while True:
-                block_start = total_target_actions - len(actions)
-                wait_target = (
-                    total_target_actions
-                    if accepted >= max_calls
-                    else block_start + min(prefetch_after, len(actions))
-                )
-                if not servo_control.wait_executed(wait_target, timeout=timeout_s):
-                    raise RuntimeError("Timed out waiting for the Servo trajectory")
+                # 按参考move_to_point语义：当前模型完整动作块执行完毕，
+                # 才采集新观测并请求下一次模型推理。
+                if not servo_control.wait_executed_in_revision(
+                    len(actions), timeout=timeout_s, revision=revision
+                ):
+                    raise RuntimeError("Timed out waiting for the complete move_to_point trajectory")
                 servo_control.raise_if_failed()
                 with robot_lock:
                     current_tcp = robot.get_tcp_pose(matrix=True)[:3, 3]
                 print(json.dumps({
                     "policy_call": accepted - 1,
                     "source_index": current_source_index,
-                    "execution_mode": "admittance_position_and_force_hybrid",
+                    "execution_mode": "move_to_point_joint_position",
                     "action_count": len(actions),
                     "nominal_ik_count": len(nominal_joints),
                     "inference_latency_s": round(float(current_latency), 6),
@@ -1276,13 +1268,23 @@ def main() -> None:
                 if accepted >= max_calls:
                     break
 
-                # 第5步后主线程采集并推理；唯一Servo线程继续执行旧块剩余
-                # 动作。新预测返回后完整追加，不按推理延迟丢弃任何动作。
+                # 当前10点完成后才开始下一轮：重新采集D455/AUBO/XJC观测，
+                # 再推理、预求解完整10步IK、提交下一段move_to_point轨迹。
                 observation = get_live_observation()
                 actions, current_latency = predict(observation)
+                with robot_lock:
+                    nominal_joints, _ = solve_continuous_joint_targets(
+                        robot,
+                        actions,
+                        camera_to_aubo_base,
+                        workspace,
+                    )
                 servo_control.raise_if_failed()
-                servo_control.submit(plan_segments(planner, actions))
-                total_target_actions += len(actions)
+                revision = servo_control.move_to_point(
+                    move_to_point_times(execution["trajectory_duration_s"], len(actions)),
+                    plan_segments(planner, actions),
+                    joint_waypoints=nominal_joints,
+                )
                 current_source_index = accepted
                 accepted += 1
 

@@ -259,15 +259,12 @@ XJC串口只能由250 Hz采集线程读取。策略观测读取最近一次有�
 ```json
 {
   "control_rate_hz": 100,
-  "action_rate_hz": 30,
+  "trajectory_duration_s": 0.333333,
   "control_mode": "force_position",
   "position_command": "send_command",
   "control_timeout_s": 0.1,
-  "position_step_m": 0.0012,
-  "rotation_step_rad": 0.0012,
   "max_tcp_speed_m_s": 0.12,
   "max_tcp_angular_speed_rad_s": 0.12,
-  "prefetch_after_actions": 5
 }
 ```
 
@@ -285,9 +282,9 @@ python deploy_aubo.py --config configs/deploy_aubo.json --max-policy-calls 100 -
 组合。
 
 部署使用NumPy多帧ZeroMQ协议传输点云，原Flexiv客户端的单帧JSON协议仍兼容。
-每次10步预测执行到第5步后，主线程采集下一次观测并请求推理；唯一Servo线程
-继续执行剩余动作。若推理晚于当前轨迹，机械臂保持最后成功位姿，不进行速度
-外推。ZeroMQ REQ socket只由主线程使用，不再启动额外的异步推理线程。
+每次策略预测的10个点会作为一个本地 `move_to_point` 轨迹块完整执行：唯一Servo
+线程持续执行该块；第10点完成后，主线程才采集下一次观测并请求下一次推理。推理
+期间Servo线程保持最后成功位姿，不进行速度外推。ZeroMQ REQ socket只由主线程使用。
 
 `servoJoint`命令持续时间由程序自动设为 `1/control_rate_hz`，不再单独配置
 `servo_duration_s`。100 Hz只提高Servo目标刷新频率，不提高模型的30 Hz动作频率，也不提高TCP

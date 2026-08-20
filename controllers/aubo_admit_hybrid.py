@@ -82,12 +82,10 @@ class AuboAdmitHybridController:
         damping: Sequence[float],
         max_acceleration: Sequence[float],
         max_velocity: Sequence[float],
-        max_pose_step: Sequence[float],
         max_force: float,
         max_torque: float,
         position_max_acceleration: Sequence[float] = None,
         position_max_velocity: Sequence[float] = None,
-        position_max_pose_step: Sequence[float] = None,
         torque_admittance_threshold: float = 0.1,
         contact_force_z: float = -3.0,
         force_integral_gain: float = 0.5,
@@ -102,11 +100,8 @@ class AuboAdmitHybridController:
         self.mass_inverse = 1.0 / self.mass
         self.max_acceleration = _vector(max_acceleration, 6, "max_acceleration")
         self.max_velocity = _vector(max_velocity, 6, "max_velocity")
-        self.max_pose_step = _vector(max_pose_step, 6, "max_pose_step")
         if np.any(self.max_acceleration <= 0) or np.any(self.max_velocity <= 0):
             raise ValueError("acceleration and velocity limits must be positive")
-        if np.any(self.max_pose_step <= 0):
-            raise ValueError("pose step limits must be positive")
         self.position_max_acceleration = _vector(
             max_acceleration
             if position_max_acceleration is None
@@ -119,17 +114,10 @@ class AuboAdmitHybridController:
             6,
             "position_max_velocity",
         )
-        self.position_max_pose_step = _vector(
-            max_pose_step if position_max_pose_step is None else position_max_pose_step,
-            6,
-            "position_max_pose_step",
-        )
         if np.any(self.position_max_acceleration <= 0) or np.any(
             self.position_max_velocity <= 0
         ):
             raise ValueError("position acceleration and velocity limits must be positive")
-        if np.any(self.position_max_pose_step <= 0):
-            raise ValueError("position pose step limits must be positive")
         if min(max_force, max_torque, torque_admittance_threshold) <= 0:
             raise ValueError("force, torque, and threshold limits must be positive")
         if integral_window <= 0:
@@ -190,11 +178,9 @@ class AuboAdmitHybridController:
         if limit_profile == "position":
             acceleration_limit = self.position_max_acceleration
             velocity_limit = self.position_max_velocity
-            pose_step_limit = self.position_max_pose_step
         elif limit_profile == "hybrid":
             acceleration_limit = self.max_acceleration
             velocity_limit = self.max_velocity
-            pose_step_limit = self.max_pose_step
         else:
             raise ValueError("limit_profile must be position or hybrid")
 
@@ -238,10 +224,9 @@ class AuboAdmitHybridController:
             self.desired_twist_tcp,
             velocity_limit,
         )
-        delta_pose_tcp = self._clip(
-            self.desired_twist_tcp * dt,
-            pose_step_limit,
-        )
+        # 不再对相邻预测位姿或单周期位姿变化增加独立裁剪。
+        # 运动变化只由速度和加速度限制决定，与原Flexiv控制语义一致。
+        delta_pose_tcp = self.desired_twist_tcp * dt
 
         command_position = current_position + current_rotation @ delta_pose_tcp[:3]
         command_rotation = current_rotation @ Rot.from_rotvec(

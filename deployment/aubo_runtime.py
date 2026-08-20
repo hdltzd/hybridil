@@ -1,6 +1,7 @@
 """AUBO实时部署的线程、背压、插值和统计基础设施。"""
 
 from collections import deque
+import json
 import math
 import threading
 import time
@@ -310,7 +311,13 @@ def interpolate_wrench(start_wrench, end_wrench, alpha):
 
 
 class SingleServoControlLoop:
-    """唯一的ServoJ写线程：无轨迹时保持，有轨迹时连续插值执行。"""
+    """纯位置部署的单线程关节轨迹 ServoJ 执行器。
+
+    每轮模型输出的10个TCP位姿会在启动Servo前连续求解为10个关节路点。
+    本类的唯一实时线程只做关节插值和 ``servoJoint``：不在线求IK，也不
+    运行第二个轨迹发布线程。这样避免Python线程竞争或IK RPC偶发延迟打断
+    AUBO的Servo指令流。
+    """
 
     def __init__(
         self,
@@ -332,19 +339,14 @@ class SingleServoControlLoop:
         if self.control_mode not in ("position", "force_position"):
             raise ValueError("control_mode must be position or force_position")
         self.control_rate = float(config["control_rate_hz"])
-        self.action_rate = float(config["action_rate_hz"])
         self.period = 1.0 / self.control_rate
-        self.action_period = 1.0 / self.action_rate
+        self.trajectory_duration = float(config["trajectory_duration_s"])
         self.timeout = float(config["control_timeout_s"])
         # Servo命令持续时间始终等于控制周期，避免JSON中两处频率配置不一致。
         self.duration = self.period
         self.lookahead = float(config.get("servo_lookahead_s", 0.1))
         self.gain = float(config.get("servo_gain", 200.0))
-        self.position_step = float(config["position_step_m"])
-        self.rotation_step = float(config["rotation_step_rad"])
         self.workspace = np.asarray(config["workspace_bounds_aubo_base"], dtype=np.float64)
-        self.max_speed = float(config["max_tcp_speed_m_s"])
-        self.max_angular_speed = float(config["max_tcp_angular_speed_rad_s"])
         self.backpressure = ServoBackpressure(
             robot,
             ServoCommandPacer(self.period),
@@ -352,11 +354,8 @@ class SingleServoControlLoop:
             config.get("servo_queue_full_max_consecutive", 5),
         )
         self._condition = threading.Condition()
-        self._pending = deque()
-        self._replacement = None
-        self._current = None
-        self._current_started = None
-        self._current_start_pose = None
+        self._joint_trajectory = None
+        self._desired = None
         self._last_command = None
         self._last_joint_command = None
         self._last_target_wrench = np.zeros(6, dtype=np.float64)
@@ -366,6 +365,9 @@ class SingleServoControlLoop:
         self._active_revision = 0
         self._executed_in_revision = 0
         self._failure = None
+        # 仅在控制线程异常时写入；必须在 robot.stop() 前采集，避免停止
+        # Servo 后覆盖控制柜原始的安全状态。
+        self._failure_snapshot = None
         self._closed = False
         self._thread = threading.Thread(target=self._run, name="aubo-servo-control", daemon=True)
 
@@ -386,6 +388,15 @@ class SingleServoControlLoop:
         with self._condition:
             return self._executed_in_revision
 
+    @property
+    def failure_snapshot(self):
+        """返回最近一次控制失败的只读诊断快照。"""
+        with self._condition:
+            if self._failure_snapshot is None:
+                return None
+            # JSON 往返可避免调用方意外修改内部嵌套字典。
+            return json.loads(json.dumps(self._failure_snapshot))
+
     def start(self):
         with self.robot_lock:
             tcp = self.robot.get_tcp_pose(matrix=True)
@@ -394,6 +405,7 @@ class SingleServoControlLoop:
         with self._condition:
             self._last_command = initial
             self._last_joint_command = np.asarray(joints, dtype=np.float64).copy()
+            self._desired = ("position", initial[0].copy(), initial[1].copy(), np.zeros(6))
         self._thread.start()
 
     def _validate_action(self, mode, action):
@@ -416,25 +428,65 @@ class SingleServoControlLoop:
                 raise RuntimeError("Predicted torque exceeds the configured safety limit")
         return mode, action.copy()
 
-    def submit(self, segments, replace=False):
-        items = []
-        for mode, actions in segments:
-            for action in np.asarray(actions):
-                items.append(self._validate_action(mode, action))
-        if not items:
+    def _validated_items(self, segments):
+        """验证模型动作段，并保留原始10个轨迹路点。"""
+        actions = []
+        for mode, segment_actions in segments:
+            for action in np.asarray(segment_actions):
+                actions.append(self._validate_action(mode, action))
+        if not actions:
             raise ValueError("Servo trajectory must contain at least one action")
+
+        return actions
+
+    def move_to_point(self, t, segments, joint_waypoints):
+        """提交一段完整的预求解关节轨迹。
+
+        参数 ``t`` 是与参考 ``MassageRobot.move_to_point`` 相同的累计到达
+        时间序列；``segments`` 仍保留原有的模型动作和模式检查。纯位置模式
+        下，``joint_waypoints`` 是与模型点一一对应的连续IK结果。
+
+        本方法不会替换仍在执行的动作，也不会自行发起下一次推理。调用方必须
+        使用 ``wait_executed_in_revision`` 等待本修订的全部点执行完成后，才
+        采集新观测并提交下一块。这与原Flexiv的“完整动作块→新观测→新推理”
+        逻辑一致。
+        """
+        if self.control_mode != "position":
+            raise RuntimeError(
+                "force_position is not supported by the single-thread joint trajectory executor"
+            )
+        items = self._validated_items(segments)
+        time_points = np.asarray(t, dtype=np.float64).reshape(-1)
+        if len(time_points) != len(items):
+            raise ValueError("move_to_point time points must match action count")
+        if not np.isfinite(time_points).all() or time_points[0] <= 0.0:
+            raise ValueError("move_to_point time points must be positive and finite")
+        if len(time_points) > 1 and np.any(np.diff(time_points) <= 0.0):
+            raise ValueError("move_to_point time points must be strictly increasing")
+        joints = np.asarray(joint_waypoints, dtype=np.float64)
+        expected_shape = (len(items), len(self._last_joint_command))
+        if joints.shape != expected_shape or not np.isfinite(joints).all():
+            raise ValueError(
+                "joint_waypoints must have shape {} and contain finite values".format(
+                    expected_shape
+                )
+            )
         with self._condition:
             self.raise_if_failed_locked()
+            if self._joint_trajectory is not None:
+                raise RuntimeError("AUBO move_to_point trajectory is already running")
             self._revision += 1
             revision = self._revision
-            if replace:
-                # 当前动作完成前不突变；在下一个30 Hz动作边界替换未来动作。
-                self._replacement = (revision, deque(items))
-            else:
-                self._pending.extend(items)
-                self._active_revision = revision
-                self._executed_in_revision = 0
+            self._active_revision = revision
+            self._executed_in_revision = 0
             self._accepted_actions += len(items)
+            self._joint_trajectory = (
+                revision,
+                time.monotonic(),
+                time_points.copy(),
+                self._last_joint_command.copy(),
+                joints.copy(),
+            )
             self._condition.notify_all()
             return revision
 
@@ -491,22 +543,6 @@ class SingleServoControlLoop:
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
 
-    def _bounded(self, current, target_position, target_quat):
-        delta = target_position - current[:3, 3]
-        distance = float(np.linalg.norm(delta))
-        max_position_step = min(self.position_step, self.max_speed * self.period)
-        if distance > max_position_step:
-            delta *= max_position_step / distance
-        position = current[:3, 3] + delta
-        target_rotation = Rot.from_quat(target_quat).as_matrix()
-        relative = Rot.from_matrix(current[:3, :3].T @ target_rotation).as_rotvec()
-        angle = float(np.linalg.norm(relative))
-        max_rotation_step = min(self.rotation_step, self.max_angular_speed * self.period)
-        if angle > max_rotation_step:
-            relative *= max_rotation_step / angle
-        rotation = current[:3, :3] @ Rot.from_rotvec(relative).as_matrix()
-        return position, Rot.from_matrix(rotation).as_quat()
-
     def _compute_command(
         self,
         current,
@@ -516,10 +552,10 @@ class SingleServoControlLoop:
         target_quat,
         target_wrench,
     ):
-        """计算一个Servo目标；柔顺位置模式的期望外力固定为零。"""
+        """计算一个Servo目标；纯位置模式直接使用轨迹发布的期望位姿。"""
         compliant = self.control_mode == "force_position"
         if not compliant:
-            return self._bounded(current, target_position, target_quat)
+            return np.asarray(target_position, dtype=np.float64), np.asarray(target_quat, dtype=np.float64)
         if self.wrench_reader is None or self.controller is None:
             raise RuntimeError("Compliant position control requires XJC and a controller")
         measured = self.controller.validate_measured_wrench(
@@ -539,60 +575,104 @@ class SingleServoControlLoop:
             limit_profile="hybrid" if mode == "hybrid" else "position",
         )
 
-    def _next_target(self, now, current):
+    def _desired_target(self):
         with self._condition:
-            if self._current is None:
-                if self._replacement is not None:
-                    revision, pending = self._replacement
-                    self._pending = pending
-                    self._replacement = None
-                    self._active_revision = revision
-                    self._executed_in_revision = 0
-                if self._pending:
-                    self._current = self._pending.popleft()
-                    self._current_started = now
-                    self._current_start_pose = (
-                        self._last_command[0].copy(),
-                        self._last_command[1].copy(),
-                        self._last_target_wrench.copy(),
-                    )
-                else:
-                    return "position", self._last_command[0], self._last_command[1], np.zeros(6), False
-            mode, action = self._current
-            target_position, target_quat, target_wrench = transform_action_to_aubo_base(
-                action, self.camera_to_aubo_base
-            )
-            alpha = min(1.0, (now - self._current_started + self.period) / self.action_period)
-            start_position, start_quat, start_wrench = self._current_start_pose
-            position, quat = interpolate_pose(
-                start_position, start_quat, target_position, target_quat, alpha
-            )
-            wrench = interpolate_wrench(start_wrench, target_wrench, alpha)
-            completed = alpha >= 1.0
-            return mode, position, quat, wrench, completed
+            mode, position, quat, wrench = self._desired
+            return mode, position.copy(), quat.copy(), wrench.copy()
 
-    def _complete_action(self, completed, wrench):
-        if not completed:
-            return
-        with self._condition:
-            self._current = None
-            self._current_started = None
-            self._current_start_pose = None
-            self._last_target_wrench = np.asarray(wrench, dtype=np.float64).copy()
-            self._executed_actions += 1
-            self._executed_in_revision += 1
-            self._condition.notify_all()
+    def _next_joint_target(self):
+        """从稀疏关节路点计算当前Servo周期的一个插值关节目标。
 
-    def _commit_servo_result(self, accepted, command_position, command_quat, completed, wrench):
-        """只有AUBO接受该帧后才能推进最后目标和动作游标。"""
-        if not accepted:
-            return
+        只执行数组运算，不访问AUBO SDK；这保证实时控制周期中不会出现
+        inverseKinematics RPC，也不需要单独的轨迹发布线程。
+        """
         with self._condition:
-            self._last_command = (
-                np.asarray(command_position, dtype=np.float64).copy(),
-                np.asarray(command_quat, dtype=np.float64).copy(),
+            if self._joint_trajectory is None:
+                return self._last_joint_command.copy(), "position"
+            revision, started, times, start_joints, waypoints = self._joint_trajectory
+            elapsed = max(0.0, time.monotonic() - started)
+            index = int(np.searchsorted(times, elapsed, side="left"))
+            if index >= len(times):
+                target = waypoints[-1].copy()
+                completed = len(times)
+            else:
+                previous_time = 0.0 if index == 0 else float(times[index - 1])
+                previous_joints = start_joints if index == 0 else waypoints[index - 1]
+                alpha = (elapsed - previous_time) / max(
+                    float(times[index]) - previous_time,
+                    1e-12,
+                )
+                target = previous_joints + np.clip(alpha, 0.0, 1.0) * (
+                    waypoints[index] - previous_joints
+                )
+                completed = int(np.count_nonzero(times <= elapsed + 1e-9))
+
+            if completed > self._executed_in_revision:
+                increment = completed - self._executed_in_revision
+                self._executed_actions += increment
+                self._executed_in_revision = completed
+                self._condition.notify_all()
+            if completed == len(times):
+                self._joint_trajectory = None
+            return np.asarray(target, dtype=np.float64).copy(), "position"
+
+    def _capture_failure_snapshot(
+        self,
+        error,
+        mode,
+        target_position,
+        target_quat,
+        command_position=None,
+        command_quat=None,
+        joint_command=None,
+    ):
+        """记录异常发生时的AUBO状态，供区分保护停机与指令问题。
+
+        此方法只能在 ``robot.stop()`` 之前调用。stop 会关闭Servo模式，
+        若在其后读取状态，将无法判断Servo究竟是控制柜主动退出，还是本进程
+        主动停止。
+        """
+        snapshot = {
+            "event": "aubo_servo_control_failure",
+            "timestamp_unix_s": round(time.time(), 6),
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "control_mode": self.control_mode,
+            "trajectory_mode": mode,
+            "desired_tcp_xyz_aubo_base": np.asarray(target_position).tolist(),
+            "desired_tcp_quat_xyzw_aubo_base": np.asarray(target_quat).tolist(),
+            "command_tcp_xyz_aubo_base": (
+                None if command_position is None else np.asarray(command_position).tolist()
+            ),
+            "command_tcp_quat_xyzw_aubo_base": (
+                None if command_quat is None else np.asarray(command_quat).tolist()
+            ),
+            "joint_command_rad": (
+                None if joint_command is None else np.asarray(joint_command).tolist()
+            ),
+            "last_joint_command_rad": (
+                None
+                if self._last_joint_command is None
+                else np.asarray(self._last_joint_command).tolist()
+            ),
+        }
+        try:
+            with self.robot_lock:
+                snapshot["aubo_status_before_stop"] = self.robot.get_status()
+                snapshot["joint_position_rad"] = self.robot.get_joint_pos().tolist()
+                snapshot["joint_velocity_rad_s"] = self.robot.get_joint_vel().tolist()
+                snapshot["tcp_pose_xyz_rpy_aubo_base"] = (
+                    self.robot.get_tcp_pose_euler().tolist()
+                )
+        except Exception as status_error:
+            snapshot["status_read_error"] = "{}: {}".format(
+                type(status_error).__name__, status_error
             )
-        self._complete_action(completed, wrench)
+
+        with self._condition:
+            self._failure_snapshot = snapshot
+        print("AUBO失败瞬间状态（stop前）：")
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
 
     def _run(self):
         previous_start = None
@@ -603,6 +683,12 @@ class SingleServoControlLoop:
                 if self._closed:
                     return
             cycle_start = time.monotonic()
+            target_position = None
+            target_quat = None
+            command_position = None
+            command_quat = None
+            joint_command = None
+            mode = None
             try:
                 if previous_start is not None and cycle_start - previous_start > self.timeout:
                     overrun_count += 1
@@ -614,35 +700,42 @@ class SingleServoControlLoop:
                             )
                         )
                 previous_start = cycle_start
-                with self.robot_lock:
-                    current = self.robot.get_tcp_pose(matrix=True)
-                current_quat = Rot.from_matrix(current[:3, :3]).as_quat()
-                mode, target_position, target_quat, target_wrench, completed = self._next_target(
-                    cycle_start, current
-                )
+                if self.control_mode == "position":
+                    joint_command, mode = self._next_joint_target()
+                    target_wrench = np.zeros(6, dtype=np.float64)
+                else:
+                    mode, target_position, target_quat, target_wrench = self._desired_target()
                 compliant = self.control_mode == "force_position"
                 if compliant and current_mode != (self.control_mode, mode):
                     self.controller.reset()
                 current_mode = (self.control_mode, mode)
-                command_position, command_quat = self._compute_command(
-                    current,
-                    current_quat,
-                    mode,
-                    target_position,
-                    target_quat,
-                    target_wrench,
-                )
-                # 插值和导纳计算后再次检查，防止控制器修正量把命令推出工作区。
-                if np.any(command_position < self.workspace[:, 0]) or np.any(
-                    command_position > self.workspace[:, 1]
-                ):
-                    raise RuntimeError("Interpolated TCP command is outside the AUBO workspace")
-                with self.robot_lock:
-                    joint_command = self.robot.inverse_kinematics(
-                        command_position,
-                        command_quat,
-                        rest_joints=self._last_joint_command,
+                if compliant:
+                    with self.robot_lock:
+                        current = self.robot.get_tcp_pose(matrix=True)
+                    current_quat = Rot.from_matrix(current[:3, :3]).as_quat()
+                    command_position, command_quat = self._compute_command(
+                        current,
+                        current_quat,
+                        mode,
+                        target_position,
+                        target_quat,
+                        target_wrench,
                     )
+                    # 插值和导纳计算后再次检查，防止控制器修正量把命令推出工作区。
+                    if np.any(command_position < self.workspace[:, 0]) or np.any(
+                        command_position > self.workspace[:, 1]
+                    ):
+                        raise RuntimeError("Interpolated TCP command is outside the AUBO workspace")
+                    with self.robot_lock:
+                        joint_command = self.robot.inverse_kinematics(
+                            command_position,
+                            command_quat,
+                            rest_joints=self._last_joint_command,
+                        )
+                else:
+                    current = None
+                    current_quat = None
+                with self.robot_lock:
                     accepted, _ = self.backpressure.send(
                         lambda: self.robot.send_command(
                             joint_command,
@@ -657,15 +750,23 @@ class SingleServoControlLoop:
                         joint_command,
                         dtype=np.float64,
                     ).copy()
-                self._commit_servo_result(
-                    accepted,
-                    command_position,
-                    command_quat,
-                    completed,
-                    target_wrench,
-                )
+                if accepted:
+                    with self._condition:
+                        self._last_command = (
+                            np.asarray(command_position, dtype=np.float64).copy(),
+                            np.asarray(command_quat, dtype=np.float64).copy(),
+                        )
                 self.statistics.record_cycle(time.monotonic() - cycle_start)
             except Exception as error:
+                self._capture_failure_snapshot(
+                    error=error,
+                    mode=mode,
+                    target_position=target_position,
+                    target_quat=target_quat,
+                    command_position=command_position,
+                    command_quat=command_quat,
+                    joint_command=joint_command,
+                )
                 try:
                     self.robot.stop()
                 except Exception:

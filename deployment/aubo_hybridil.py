@@ -127,13 +127,19 @@ class PlannedChunk:
 class ActionChunkPlanner:
     """Reproduce the ForceMimic force-threshold execution state machine."""
 
-    def __init__(self, force_threshold: float = 6.0, force_ratio: float = 0.2):
+    def __init__(
+        self,
+        force_threshold: float = 6.0,
+        force_ratio: float = 0.2,
+        hybrid_force_enabled: bool = True,
+    ):
         if not np.isfinite(force_threshold) or force_threshold <= 0:
             raise ValueError("force_threshold must be positive")
         if not np.isfinite(force_ratio) or not 0.0 <= force_ratio <= 1.0:
             raise ValueError("force_ratio must be between 0 and 1")
         self.force_threshold = float(force_threshold)
         self.force_ratio = float(force_ratio)
+        self.hybrid_force_enabled = bool(hybrid_force_enabled)
         self.initial_force_detection = True
 
     @staticmethod
@@ -152,6 +158,10 @@ class ActionChunkPlanner:
 
     def plan(self, actions: Sequence[Sequence[float]]) -> PlannedChunk:
         actions_array = self._actions(actions)
+        # 纯位置部署阶段与原 Flexiv 的 NRT_JOINT_POSITION 语义对齐：
+        # 预测力保留在模型输出中，但不参与实际控制模式切换。
+        if not self.hybrid_force_enabled:
+            return PlannedChunk("position", actions_array)
         forces = np.linalg.norm(actions_array[:, 7:10], axis=1)
         high = forces > self.force_threshold
         enough_high_force = int(np.count_nonzero(high)) > len(high) * self.force_ratio

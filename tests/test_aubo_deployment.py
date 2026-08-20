@@ -19,6 +19,7 @@ from deploy_aubo import (
     make_coordinate_frames,
     make_controller,
     make_policy_ready_pose,
+    move_to_point_times,
     solve_continuous_joint_targets,
     load_json,
     validate_deployment_config,
@@ -565,8 +566,9 @@ class TestServoRuntime(unittest.TestCase):
                     np.asarray(kwargs["target_quat_xyzw_base"]),
                 )
 
-        config = load_json("configs/deploy_aubo.json")["execution"]
         controller = Controller()
+        config = load_json("configs/deploy_aubo.json")["execution"]
+        config["control_mode"] = "force_position"
         loop = SingleServoControlLoop(
             robot=object(),
             wrench_reader=lambda quaternion: np.ones(6),
@@ -606,12 +608,14 @@ class TestServoRuntime(unittest.TestCase):
                 return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])
 
         controller = Controller()
+        config = load_json("configs/deploy_aubo.json")["execution"]
+        config["control_mode"] = "force_position"
         loop = SingleServoControlLoop(
             robot=object(),
             wrench_reader=lambda quaternion: np.zeros(6),
             controller=controller,
             camera_to_aubo_base=np.eye(4),
-            config=load_json("configs/deploy_aubo.json")["execution"],
+            config=config,
             robot_lock=threading.RLock(),
             statistics=RuntimeStatistics(),
         )
@@ -628,77 +632,33 @@ class TestServoRuntime(unittest.TestCase):
 
         np.testing.assert_array_equal(controller.desired, predicted)
 
-    @staticmethod
-    def make_buffer_only_loop():
-        loop = SingleServoControlLoop.__new__(SingleServoControlLoop)
-        loop._condition = threading.Condition()
-        loop._pending = deque()
-        loop._replacement = None
-        loop._current = None
-        loop._current_started = None
-        loop._current_start_pose = None
-        loop._last_command = (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
-        loop._last_target_wrench = np.zeros(6)
-        loop._active_revision = 1
-        loop._executed_in_revision = 0
-        loop.action_period = 1.0 / 30.0
-        loop.period = 1.0 / 60.0
-        loop.camera_to_aubo_base = np.eye(4)
-        return loop
-
-    def test_new_prediction_replaces_only_at_action_boundary(self):
-        loop = self.make_buffer_only_loop()
-        old = action_trajectory(1, [0, 0, 0])[0]
-        new = old.copy()
-        new[0] = 0.2
-        loop._current = ("position", old)
-        loop._current_started = 0.0
-        loop._current_start_pose = (
-            np.zeros(3),
-            np.array([0.0, 0.0, 0.0, 1.0]),
-            np.zeros(6),
+    def test_move_to_point_submits_sparse_joint_waypoints(self):
+        """纯位置move_to_point只保存10个IK关节路点，不预生成稠密TCP点。"""
+        loop = SingleServoControlLoop(
+            robot=object(),
+            wrench_reader=None,
+            controller=None,
+            camera_to_aubo_base=np.eye(4),
+            config=load_json("configs/deploy_aubo.json")["execution"],
+            robot_lock=threading.RLock(),
+            statistics=RuntimeStatistics(),
         )
-        loop._replacement = (2, deque([("position", new)]))
+        loop._last_joint_command = np.zeros(6)
+        segments = [("position", action_trajectory(10, [0, 0, 0]))]
+        t = move_to_point_times(0.5, 10)
+        joint_waypoints = np.tile(np.arange(6, dtype=np.float64), (10, 1))
 
-        loop._next_target(0.01, np.eye(4))
-        self.assertEqual(loop._active_revision, 1)
-        self.assertIsNotNone(loop._replacement)
+        self.assertEqual(loop.move_to_point(t, segments, joint_waypoints), 1)
+        revision, _, stored_times, _, stored_joints = loop._joint_trajectory
+        self.assertEqual(revision, 1)
+        self.assertEqual(len(stored_times), len(t))
+        self.assertEqual(len(stored_joints), len(t))
 
-        loop._current = None
-        loop._next_target(0.02, np.eye(4))
-        self.assertEqual(loop._active_revision, 2)
-        self.assertIsNone(loop._replacement)
-
-    def test_exhausted_prediction_holds_last_successful_pose(self):
-        loop = self.make_buffer_only_loop()
-        loop._last_command = (
-            np.array([0.1, 0.2, 0.3]),
-            np.array([0.0, 0.0, 0.0, 1.0]),
+    def test_move_to_point_times_match_reference_cumulative_t_semantics(self):
+        np.testing.assert_allclose(
+            move_to_point_times(0.5, 10),
+            np.linspace(0.05, 0.5, 10),
         )
-
-        mode, position, quat, wrench, completed = loop._next_target(0.0, np.eye(4))
-
-        self.assertEqual(mode, "position")
-        np.testing.assert_array_equal(position, [0.1, 0.2, 0.3])
-        np.testing.assert_array_equal(quat, [0, 0, 0, 1])
-        np.testing.assert_array_equal(wrench, np.zeros(6))
-        self.assertFalse(completed)
-
-    def test_rejected_servo_frame_does_not_update_last_command(self):
-        loop = self.make_buffer_only_loop()
-        old_position = loop._last_command[0].copy()
-
-        loop._commit_servo_result(
-            False,
-            np.ones(3),
-            np.array([0.0, 0.0, 0.0, 1.0]),
-            True,
-            np.zeros(6),
-        )
-
-        np.testing.assert_array_equal(loop._last_command[0], old_position)
-        self.assertEqual(loop._executed_in_revision, 0)
-
 
 class TestLatestWrenchCache(unittest.TestCase):
     class Sensor:
@@ -809,12 +769,16 @@ class TestDeploymentConfiguration(unittest.TestCase):
         config = load_json("configs/deploy_aubo.json")
         self.assertEqual(validate_deployment_config(config, self.make_args()), 0.0)
         self.assertEqual(config["execution"]["control_rate_hz"], 100)
-        self.assertEqual(config["execution"]["control_mode"], "force_position")
+        self.assertEqual(config["execution"]["control_mode"], "position")
         self.assertEqual(config["execution"]["position_command"], "send_command")
         self.assertEqual(config["controller_config"], "configs/aubo_admit_hybrid.json")
         self.assertNotIn("servo_duration_s", config["execution"])
-        self.assertEqual(config["execution"]["position_step_m"], 0.0012)
-        self.assertEqual(config["execution"]["rotation_step_rad"], 0.0012)
+        self.assertNotIn("position_step_m", config["execution"])
+        self.assertNotIn("rotation_step_rad", config["execution"])
+        self.assertNotIn("prefetch_after_actions", config["execution"])
+        self.assertNotIn("command_rate_hz", config["execution"])
+        self.assertNotIn("max_tcp_speed_m_s", config["execution"])
+        self.assertNotIn("max_tcp_angular_speed_rad_s", config["execution"])
         loop = SingleServoControlLoop(
             robot=object(),
             wrench_reader=None,
@@ -839,13 +803,6 @@ class TestDeploymentConfiguration(unittest.TestCase):
                 config,
                 self.make_args(hold_seconds=30.0, execute=True, prepare=True),
             )
-
-    def test_theoretical_tcp_speed_is_checked_before_hardware(self):
-        config = load_json("configs/deploy_aubo.json")
-        config["execution"]["position_step_m"] = 0.01
-
-        with self.assertRaisesRegex(ValueError, "above max_tcp_speed"):
-            validate_deployment_config(config, self.make_args())
 
     def test_non_contact_profile_is_faster_than_contact_profile(self):
         controller = make_controller("configs/aubo_admit_hybrid.json")
@@ -995,7 +952,6 @@ class TestAuboActionExecutorSafety(unittest.TestCase):
             damping=np.ones(6),
             max_acceleration=np.ones(6),
             max_velocity=np.ones(6),
-            max_pose_step=np.ones(6) * 0.01,
             max_force=20.0,
             max_torque=3.0,
         )
@@ -1004,10 +960,10 @@ class TestAuboActionExecutorSafety(unittest.TestCase):
     def make_config(control_rate=125, timeout=0.02):
         return {
             "control_rate_hz": control_rate,
-            "action_rate_hz": 1000,
+            "trajectory_duration_s": 0.001,
             "control_timeout_s": timeout,
-            "position_step_m": 0.0001,
-            "rotation_step_rad": 0.001,
+            "max_tcp_speed_m_s": 0.1,
+            "max_tcp_angular_speed_rad_s": 0.2,
             "workspace_bounds_aubo_base": [
                 [-0.8, 0.8],
                 [-0.8, 0.8],

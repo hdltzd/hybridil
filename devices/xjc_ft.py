@@ -1,17 +1,20 @@
 """XJC six-axis force/torque sensor driver.
 
-The adapter implements the protocol used by the supplied XJC reference code
-without changing device permissions, invoking sudo, starting remote services,
-or creating background threads. Constructing the class only opens the selected
-serial transport. Sensor zeroing and streaming are explicit operations.
+The adapter implements the protocol used by the supplied XJC reference code.
+It can either open a local serial device directly, or own a local ``socat``
+PTY that connects to the AUBO controller's ``ser2net`` TCP endpoint. It never
+changes device permissions or starts remote services. Sensor zeroing and
+streaming are explicit operations.
 
 Returned wrench order and units are ``[Fx, Fy, Fz, Tx, Ty, Tz]`` in N and Nm.
 """
 
+import os
 import struct
+import subprocess
 import time
 from numbers import Integral, Real
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 
@@ -26,6 +29,95 @@ class XjcConnectionError(XjcError):
 
 class XjcProtocolError(XjcError):
     """A sensor packet was incomplete or failed validation."""
+
+
+class SocatSerialBridge:
+    """Create ``local_port`` as a PTY connected to remote ser2net TCP."""
+
+    def __init__(self, config: Dict) -> None:
+        self.config = dict(config)
+        self.process = None
+        self.created_link = False
+        self.local_port = self.config.get("local_port", "/tmp/ttyRobotTool")
+
+    def start(self) -> str:
+        host = self.config.get("host")
+        tcp_port = self.config.get("tcp_port", 5000)
+        if not isinstance(host, str) or not host:
+            raise XjcConnectionError("XJC socat transport.host is required")
+        if not isinstance(tcp_port, Integral) or not 0 < tcp_port <= 65535:
+            raise XjcConnectionError("XJC socat tcp_port must be in 1..65535")
+        if not isinstance(self.local_port, str) or not self.local_port.startswith("/"):
+            raise XjcConnectionError("XJC socat local_port must be an absolute path")
+
+        if os.path.exists(self.local_port):
+            if self.config.get("reuse_existing", True):
+                return self.local_port
+            raise XjcConnectionError(
+                "XJC local PTY {!r} already exists".format(self.local_port)
+            )
+        if os.path.lexists(self.local_port):
+            raise XjcConnectionError(
+                "XJC local PTY {!r} is a stale link; remove it after confirming no "
+                "socat process owns it".format(self.local_port)
+            )
+
+        try:
+            self.process = subprocess.Popen(
+                [
+                    "socat",
+                    "PTY,raw,echo=0,link={}".format(self.local_port),
+                    "TCP:{}:{}".format(host, int(tcp_port)),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError as error:
+            raise XjcConnectionError("The XJC socat transport requires 'socat'") from error
+
+        timeout_s = float(self.config.get("startup_timeout_s", 3.0))
+        if not np.isfinite(timeout_s) or timeout_s <= 0:
+            self.close()
+            raise ValueError("XJC socat startup_timeout_s must be positive")
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(self.local_port):
+                self.created_link = True
+                return self.local_port
+            if self.process.poll() is not None:
+                error_text = self.process.stderr.read() if self.process.stderr else ""
+                self.close()
+                raise XjcConnectionError(
+                    "socat could not connect XJC transport {}:{}: {}".format(
+                        host,
+                        tcp_port,
+                        error_text.strip(),
+                    )
+                )
+            time.sleep(0.02)
+        self.close()
+        raise XjcConnectionError(
+            "Timed out creating XJC PTY {} for {}:{}".format(
+                self.local_port,
+                host,
+                tcp_port,
+            )
+        )
+
+    def close(self) -> None:
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=1.0)
+            self.process = None
+        if self.created_link and os.path.islink(self.local_port):
+            os.unlink(self.local_port)
+        self.created_link = False
 
 
 class XjcForceTorqueSensor:
@@ -60,6 +152,7 @@ class XjcForceTorqueSensor:
         slave_address: int = 0x01,
         sample_rate: int = 250,
         usb_selector: Optional[str] = None,
+        transport: Optional[Dict] = None,
     ) -> None:
         self._validate_parameters(
             port,
@@ -69,6 +162,8 @@ class XjcForceTorqueSensor:
             sample_rate,
             usb_selector,
         )
+        if transport is not None and not isinstance(transport, dict):
+            raise ValueError("transport must be an object or null")
         try:
             import serial
             import serial.tools.list_ports
@@ -84,9 +179,19 @@ class XjcForceTorqueSensor:
         self.sample_rate = int(sample_rate)
         self.streaming_enabled = False
         self.serial = None
+        self.bridge = None
         self._closed = False
 
         selected_port = port
+        if transport is not None:
+            transport_type = transport.get("type", "direct")
+            if transport_type == "socat_tcp":
+                self.bridge = SocatSerialBridge(transport)
+                selected_port = self.bridge.start()
+            elif transport_type != "direct":
+                raise ValueError(
+                    "Unsupported XJC transport.type {!r}".format(transport_type)
+                )
         if usb_selector is not None:
             selected_port = self.find_port(usb_selector)
         if selected_port is None:
@@ -292,6 +397,8 @@ class XjcForceTorqueSensor:
                     pass
                 self.serial.close()
         finally:
+            if self.bridge is not None:
+                self.bridge.close()
             self._closed = True
 
     disconnect = close
@@ -307,4 +414,3 @@ class XjcForceTorqueSensor:
             self.close()
         except Exception:
             pass
-

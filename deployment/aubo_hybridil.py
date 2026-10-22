@@ -127,13 +127,19 @@ class PlannedChunk:
 class ActionChunkPlanner:
     """Reproduce the ForceMimic force-threshold execution state machine."""
 
-    def __init__(self, force_threshold: float = 6.0, force_ratio: float = 0.2):
+    def __init__(
+        self,
+        force_threshold: float = 6.0,
+        force_ratio: float = 0.2,
+        hybrid_force_enabled: bool = True,
+    ):
         if not np.isfinite(force_threshold) or force_threshold <= 0:
             raise ValueError("force_threshold must be positive")
         if not np.isfinite(force_ratio) or not 0.0 <= force_ratio <= 1.0:
             raise ValueError("force_ratio must be between 0 and 1")
         self.force_threshold = float(force_threshold)
         self.force_ratio = float(force_ratio)
+        self.hybrid_force_enabled = bool(hybrid_force_enabled)
         self.initial_force_detection = True
 
     @staticmethod
@@ -152,6 +158,10 @@ class ActionChunkPlanner:
 
     def plan(self, actions: Sequence[Sequence[float]]) -> PlannedChunk:
         actions_array = self._actions(actions)
+        # 纯位置部署阶段与原 Flexiv 的 NRT_JOINT_POSITION 语义对齐：
+        # 预测力保留在模型输出中，但不参与实际控制模式切换。
+        if not self.hybrid_force_enabled:
+            return PlannedChunk("position", actions_array)
         forces = np.linalg.norm(actions_array[:, 7:10], axis=1)
         high = forces > self.force_threshold
         enough_high_force = int(np.count_nonzero(high)) > len(high) * self.force_ratio
@@ -367,11 +377,14 @@ class ReplaySource:
 class InferenceClient:
     """Validated ZeroMQ client for the existing ``node.py`` policy server."""
 
-    def __init__(self, endpoint: str, timeout_ms: int = 120000) -> None:
+    def __init__(self, endpoint: str, timeout_ms: int = 120000, protocol="json") -> None:
         if not isinstance(endpoint, str) or not endpoint.startswith("tcp://"):
             raise ValueError("endpoint must be a tcp:// ZeroMQ endpoint")
         if timeout_ms <= 0:
             raise ValueError("timeout_ms must be positive")
+        if protocol not in ("json", "numpy"):
+            raise ValueError("inference protocol must be json or numpy")
+        self.protocol = protocol
         try:
             import zmq
         except ImportError as error:
@@ -385,20 +398,26 @@ class InferenceClient:
         self.socket.connect(endpoint)
 
     def predict(self, name: str, observation: Dict[str, np.ndarray]) -> np.ndarray:
-        payload = {"name": name}
+        validated = {}
         for key in ReplaySource.OBSERVATION_KEYS:
             if key not in observation:
                 raise KeyError("observation is missing {!r}".format(key))
             value = np.asarray(observation[key])
             if not np.isfinite(value).all():
                 raise ValueError("observation {!r} contains NaN or Inf".format(key))
-            payload[key] = value.tolist()
+            validated[key] = value
         try:
-            self.socket.send_string(json.dumps(payload))
-            response = json.loads(self.socket.recv_string())
+            if self.protocol == "numpy":
+                self.socket.send_multipart(encode_numpy_request(name, validated))
+                actions = decode_numpy_response(self.socket.recv_multipart())
+            else:
+                payload = {"name": name}
+                payload.update({key: value.tolist() for key, value in validated.items()})
+                self.socket.send_string(json.dumps(payload))
+                response = json.loads(self.socket.recv_string())
+                actions = np.asarray(response.get("action"), dtype=np.float64)
         except self.zmq.Again as error:
             raise TimeoutError("Timed out communicating with the policy server") from error
-        actions = np.asarray(response.get("action"), dtype=np.float64)
         if actions.ndim != 2 or actions.shape[1] != ACTION_DIM or len(actions) == 0:
             raise RuntimeError("policy server returned an invalid action shape")
         if not np.isfinite(actions).all():
@@ -418,3 +437,69 @@ class InferenceClient:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+
+NUMPY_PROTOCOL = "hybridil-numpy-v1"
+
+
+def _array_from_frame(description, frame):
+    dtype = np.dtype(description["dtype"])
+    shape = tuple(int(value) for value in description["shape"])
+    expected = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    if len(frame) != expected:
+        raise ValueError("NumPy protocol frame size does not match its metadata")
+    return np.frombuffer(frame, dtype=dtype).reshape(shape).copy()
+
+
+def encode_numpy_request(name, observation):
+    """将策略观测编码为小型JSON头和连续NumPy字节帧。"""
+    descriptions = []
+    frames = []
+    for key in ReplaySource.OBSERVATION_KEYS:
+        value = np.ascontiguousarray(observation[key])
+        descriptions.append({"name": key, "dtype": value.dtype.str, "shape": value.shape})
+        frames.append(value.tobytes(order="C"))
+    header = {
+        "protocol": NUMPY_PROTOCOL,
+        "name": name,
+        "arrays": descriptions,
+    }
+    return [json.dumps(header).encode("utf-8"), *frames]
+
+
+def decode_numpy_request(parts):
+    if len(parts) < 2:
+        raise ValueError("NumPy policy request must contain metadata and array frames")
+    header = json.loads(parts[0].decode("utf-8"))
+    if header.get("protocol") != NUMPY_PROTOCOL:
+        raise ValueError("Unsupported NumPy policy protocol")
+    descriptions = header.get("arrays", [])
+    if len(descriptions) != len(parts) - 1:
+        raise ValueError("NumPy policy request frame count mismatch")
+    observation = {
+        description["name"]: _array_from_frame(description, frame)
+        for description, frame in zip(descriptions, parts[1:])
+    }
+    missing = [key for key in ReplaySource.OBSERVATION_KEYS if key not in observation]
+    if missing:
+        raise KeyError("NumPy policy request is missing {}".format(missing))
+    return header["name"], observation
+
+
+def encode_numpy_response(name, actions):
+    actions = np.ascontiguousarray(actions)
+    header = {
+        "protocol": NUMPY_PROTOCOL,
+        "name": name,
+        "action": {"dtype": actions.dtype.str, "shape": actions.shape},
+    }
+    return [json.dumps(header).encode("utf-8"), actions.tobytes(order="C")]
+
+
+def decode_numpy_response(parts):
+    if len(parts) != 2:
+        raise ValueError("NumPy policy response must contain metadata and one action frame")
+    header = json.loads(parts[0].decode("utf-8"))
+    if header.get("protocol") != NUMPY_PROTOCOL:
+        raise ValueError("Unsupported NumPy policy protocol")
+    return np.asarray(_array_from_frame(header["action"], parts[1]), dtype=np.float64)

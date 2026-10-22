@@ -1,12 +1,59 @@
 {
-    "port": "/dev/ttyUSB0",
+    "_说明": "XJC六维力传感器配置文件。力单位为N，力矩单位为Nm，长度单位为米，时间单位为秒。以_开头的字段仅用于注释说明，程序加载配置时自动忽略。",
+    "_连接配置说明": {
+        "port": "串口设备路径：当前为socat创建的虚拟串口，桥接到AUBO控制柜内部ser2net服务；传感器直连工控机USB时通常填/dev/ttyUSB0",
+        "usb_selector": "USB自动匹配规则：null表示使用port字段的固定路径；填写字符串时自动扫描所有串口，匹配设备描述/序列号包含该字符串的设备，解决ttyUSB编号漂移问题",
+        "transport": "传输层配置：null表示直连本地物理/虚拟串口；远程TCP模式填{\"type\":\"socat_tcp\",\"host\":\"控制柜IP\",\"tcp_port\":5000}自动创建socat串口桥接",
+        "baudrate": "串口通信波特率，XJC传感器默认固定115200，请勿修改"
+    },
+    "port": "/dev/ttyRobotTool",
     "usb_selector": null,
+    "transport": null,
     "baudrate": 115200,
+
+    "_基础采样配置说明": {
+        "timeout_s": "单次读取力数据超时时间，单位秒：250Hz采样周期为4ms，若频繁报超时错误可适当调大到0.01（10ms）",
+        "read_retries": "读取失败（超时/CRC校验错误）最大重试次数",
+        "slave_address": "Modbus RTU从站地址，单传感器场景默认0x01（十进制1）无需修改",
+        "sample_rate": "传感器采样频率，单位Hz：支持100/250/500三档，250Hz匹配100Hz控制率，兼顾稳定性和实时性"
+    },
     "timeout_s": 0.006,
+    "read_retries": 3,
     "slave_address": 1,
     "sample_rate": 250,
+
+    "_自动清零配置说明": {
+        "zero_on_startup": "启动时是否自动执行零点校准：⚠️ 清零时必须保证传感器完全静止、末端刀具无接触任何物体，否则会产生固定力偏移影响力控精度",
+        "zero_prepare_seconds": "清零前等待时间，单位秒，预留传感器上电稳定、机器人震动消除的缓冲时间",
+        "zero_response_timeout_s": "等待清零命令响应超时时间，清零失败率高时可调大到0.2s",
+        "zero_retries": "清零失败最大重试次数",
+        "zero_retry_delay_s": "清零重试间隔时间，单位秒",
+        "zero_initial_disable_count": "首次清零前发送停止流式命令的次数，清理传感器残留流式数据避免命令响应异常",
+        "zero_retry_disable_count": "重试清零前发送停止流式命令的次数",
+        "zero_polling_count": "清零完成后连续采样次数，取平均值验证清零效果",
+        "zero_command_count": "连续发送清零命令的次数，防止单次命令丢包导致清零失败",
+        "zero_tolerance": "清零成功判定阈值，单位N/Nm：XJC传感器固有噪声约0.01~0.05N，当前0.001阈值偏严，建议调大到0.05，不影响力控精度（削皮接触力通常>2N）",
+        "zero_settle_seconds": "清零完成后稳定等待时间，单位秒，等待传感器输出稳定后再进入正常工作模式"
+    },
     "zero_on_startup": true,
+    "zero_prepare_seconds": 0.5,
+    "zero_response_timeout_s": 0.1,
+    "zero_retries": 5,
+    "zero_retry_delay_s": 0.5,
+    "zero_initial_disable_count": 3,
+    "zero_retry_disable_count": 2,
+    "zero_polling_count": 3,
+    "zero_command_count": 2,
+    "zero_tolerance": 0.0015,
     "zero_settle_seconds": 1.0,
+
+    "_重力补偿与坐标变换说明": {
+        "force_zero": "力通道手动零点偏移，单位N，自动清零后仍有固定偏移时可手动填写数值抵消",
+        "torque_zero": "力矩通道手动零点偏移，单位Nm",
+        "gravity_in_aubo_base": "重力加速度在AUBO基坐标系下的矢量，单位m/s²：当前为[0,0,0]表示未开启重力补偿，标定完成后应填[0,0,-9.81]（Z轴向上时），控制器会根据机器人实时末端姿态自动扣除工具重力分量",
+        "center_of_mass_in_sensor": "末端刀具+夹具重心在传感器坐标系下的位置，单位米，用于计算重力产生的力矩偏移，需实机标定",
+        "XJC_2_TCP": "4×4齐次变换矩阵，描述XJC传感器坐标系→机器人TCP（工具中心点）坐标系的外参；当前为单位矩阵表示两坐标系完全重合，实际安装存在偏移/旋转时需标定"
+    },
     "force_zero": [0.0, 0.0, 0.0],
     "torque_zero": [0.0, 0.0, 0.0],
     "gravity_in_aubo_base": [0.0, 0.0, 0.0],

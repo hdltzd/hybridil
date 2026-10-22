@@ -1131,8 +1131,8 @@ def action_stats_to_normalization_stats(action_stats, action_config):
             input_max[0, 3:7] = 1 * np.ones_like(input_min[0, 3:7])
             
             # instead of -1 and 1 use numbers just below threshold to prevent numerical instability issues
-            output_min = -0.999999
-            output_max = 0.999999
+            output_min = -0.9
+            output_max = 0.9
             
             # ignore input dimentions that is too small to prevent division by zero
             input_range = input_max - input_min

@@ -12,14 +12,21 @@ Args:
 
     dataset (str): if provided, override the dataset path defined in the config
 
-    debug (bool): set this flag to run a quick training run for debugging purposes    
+    debug (bool): set this flag to run a quick training run for debugging purposes
 """
+
+# 全局限制底层库线程数，避免DataLoader多进程时CPU线程过订阅争抢
+# 必须在import torch/numpy/cv2等库之前设置才生效
+import os
+os.environ["OMP_NUM_THREADS"] = "1"       # OpenMP线程数
+os.environ["MKL_NUM_THREADS"] = "1"       # Intel MKL线程数
+os.environ["OPENBLAS_NUM_THREADS"] = "1"  # OpenBLAS线程数
+os.environ["NUMEXPR_NUM_THREADS"] = "1"   # NumExpr线程数
 
 import argparse
 import json
 import numpy as np
 import time
-import os
 import shutil
 import psutil
 import sys
@@ -94,6 +101,7 @@ def train(config, device, auto_remove_exp=False, resume=None):
 
     # set num workers
     torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
 
     print("\n============= New Training Run with Config =============")
     print(config)
@@ -189,11 +197,11 @@ def train(config, device, auto_remove_exp=False, resume=None):
         batch_size=config.train.batch_size,
         shuffle=(train_sampler is None),
         num_workers=config.train.num_data_workers,
-        drop_last=True
+        drop_last=True,
 
-        # pin_memory=True,          # 开启锁页内存
-        # persistent_workers=True,  # worker进程常驻
-        # prefetch_factor=2         # 每个worker提前预取2个batch
+        pin_memory=False,          # 开启锁页内存
+        persistent_workers=True,  # worker进程常驻
+        # prefetch_factor=1         # 每个worker提前预取2个batch
     )
 
     if config.experiment.validate:

@@ -1,7 +1,7 @@
 {
     "algo_name": "diffusion_policy",
     "experiment": {
-        "name": "AnYa",
+        "name": "TuiYa_1",
         "validate": false,
         "logging": {
             "terminal_output_to_txt": true,
@@ -38,12 +38,12 @@
     "train": {
         "data": [
             {
-                "path": "peel_data/AnYa.hdf5"
+                "path": "peel_data/TuiYa.hdf5"
             }
         ],
         "output_dir": "logs",
-        "num_data_workers": 4,
-        "hdf5_cache_mode": null,
+        "num_data_workers": 6,
+        "hdf5_cache_mode": "low_dim",
         "hdf5_use_swmr": true,
         "hdf5_load_next_obs": false,
         "hdf5_normalize_obs": false,
@@ -91,7 +91,7 @@
         },
         "goal_mode": null,
         "cuda": true,
-        "batch_size": 128,
+        "batch_size": 96,
         "num_epochs": 3000,
         "seed": 1,
         "data_format": "robomimic"

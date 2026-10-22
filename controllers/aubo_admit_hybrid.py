@@ -255,3 +255,58 @@ class AuboAdmitHybridController:
             rotations.transpose(0, 2, 1) @ force_in_camera[:, :, None]
         )[:, :, 0]
         return result
+
+
+class AuboDeploymentControllerManager:
+    """部署运行时的最小控制器管理层。
+
+    参考 MassageRobot 的 ControllerManager 仅保留当前任务实际需要的两种
+    模式：非接触 ``position`` 与接触 ``admithybrid``。位置模式由运行时的
+    预求解关节轨迹执行；接触模式才调用导纳控制器并实时修正 TCP 目标。
+    """
+
+    POSITION = "position"
+    ADMIT_HYBRID = "admithybrid"
+
+    def __init__(self, admit_hybrid: AuboAdmitHybridController = None) -> None:
+        self.admit_hybrid = admit_hybrid
+        self.current_controller_name = self.POSITION
+
+    def switch_controller(self, name: str) -> bool:
+        if name not in (self.POSITION, self.ADMIT_HYBRID):
+            raise ValueError("unsupported deployment controller: {}".format(name))
+        if name == self.ADMIT_HYBRID and self.admit_hybrid is None:
+            raise RuntimeError("admithybrid controller is not configured")
+        if name == self.current_controller_name:
+            return False
+        self.current_controller_name = name
+        # 接触开始时丢弃上一段导纳积分与虚拟速度，避免非接触阶段残留状态。
+        if name == self.ADMIT_HYBRID:
+            self.admit_hybrid.reset()
+        return True
+
+    def step(
+        self,
+        current_position_base: Sequence[float],
+        current_quat_xyzw_base: Sequence[float],
+        target_position_base: Sequence[float],
+        target_quat_xyzw_base: Sequence[float],
+        measured_wrench_tcp: Sequence[float],
+        desired_wrench_tcp: Sequence[float],
+        dt: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if self.current_controller_name == self.POSITION:
+            return (
+                _vector(target_position_base, 3, "target_position").copy(),
+                _vector(target_quat_xyzw_base, 4, "target_quaternion").copy(),
+            )
+        return self.admit_hybrid.step(
+            current_position_base=current_position_base,
+            current_quat_xyzw_base=current_quat_xyzw_base,
+            target_position_base=target_position_base,
+            target_quat_xyzw_base=target_quat_xyzw_base,
+            measured_wrench_tcp=measured_wrench_tcp,
+            desired_wrench_tcp=desired_wrench_tcp,
+            dt=dt,
+            limit_profile="hybrid",
+        )

@@ -568,7 +568,7 @@ class TestServoRuntime(unittest.TestCase):
 
         controller = Controller()
         config = load_json("configs/deploy_aubo.json")["execution"]
-        config["control_mode"] = "force_position"
+        config["control_mode"] = "position_hybrid"
         loop = SingleServoControlLoop(
             robot=object(),
             wrench_reader=lambda quaternion: np.ones(6),
@@ -609,7 +609,7 @@ class TestServoRuntime(unittest.TestCase):
 
         controller = Controller()
         config = load_json("configs/deploy_aubo.json")["execution"]
-        config["control_mode"] = "force_position"
+        config["control_mode"] = "position_hybrid"
         loop = SingleServoControlLoop(
             robot=object(),
             wrench_reader=lambda quaternion: np.zeros(6),

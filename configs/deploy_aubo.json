@@ -26,6 +26,28 @@
         "timeout_ms": 120000,
         "protocol": "numpy"
     },
+    "telemetry": {
+        "_说明": {
+            "enabled": "true时将预测轨迹、实际TCP位姿和XJC实测六维力写入JSONL，供本地浏览器仪表盘读取；默认false，不额外增加AUBO状态读取。",
+            "path": "JSONL遥测文件路径；建议放在logs目录，运行新任务时可自动覆盖旧文件。",
+            "sample_rate_hz": "实际TCP与XJC在Servo线程中的记录频率，不是控制频率。建议5~10Hz；提高会增加额外AUBO状态RPC，可能影响实时性。",
+            "truncate_on_start": "true表示每次部署启动覆盖旧遥测文件，便于浏览器只显示本次任务。"
+        },
+        "enabled": true,
+        "path": "logs/aubo_telemetry.jsonl",
+        "sample_rate_hz": 10,
+        "truncate_on_start": true
+    },
+    "browser_control": {
+        "_说明": {
+            "enabled": "仅当true时，部署进程才读取浏览器写入的本机命令文件；默认false。网页服务也必须以--allow-control启动，形成双重开关。",
+            "command_path": "浏览器仪表盘与部署进程之间的本机JSONL命令文件。请保持在本机目录，不要通过公网共享。",
+            "reset_init_pos": "网页复位会停止当前轨迹，使用preparation.init_joint_waypoints_rad低速MoveJ返回init_pos，并结束本次部署；不会清除控制柜故障或重新上电。",
+            "software_stop": "网页停止只调用软件stopMove，不替代控制柜/示教器实体急停。"
+        },
+        "enabled": true,
+        "command_path": "logs/aubo_dashboard_commands.jsonl"
+    },
     "policy": {
         "_说明": {
             "obs_horizon": "模型一次使用的历史观测帧数，必须与训练checkpoint一致。",
@@ -39,7 +61,7 @@
         "act_horizon": 10,
         "point_count": 10000,
         "voxel_size": 0.001,
-        "force_threshold": 1.0,
+        "force_threshold": 0.5,
         "force_ratio": 0.2
     },
     "camera": {
@@ -111,17 +133,17 @@
     },
     "execution": {
         "_说明": {
-            "control_mode": "当前部署仅支持position纯位置控制：模型TCP位姿先连续求解为关节路点，再发送AUBO ServoJ；XJC仅作为模型观测。后续重新接入力位混合时再扩展force_position。",
-            "position_command": "send_command表示启动Servo前连续求解10步名义IK；运行时单一Servo线程只插值关节路点并通过AUBO参考接口发送，不在线求IK。MoveJ仅用于准备阶段。",
+            "control_mode": "position表示始终纯位置控制；position_hybrid表示按模型预测力在position与admithybrid之间切换。",
+            "position_command": "send_command表示非接触position段启动Servo前连续求解IK；运行时单一Servo线程只插值关节路点并发送。接触admithybrid段则实时读取XJC、导纳修正TCP、实时IK后发送。MoveJ仅用于准备阶段。",
             "control_rate_hz": "唯一Servo控制线程的固定频率；每个周期插值一个关节目标并发送一次servoJoint，命令持续时间自动计算为1/control_rate_hz。",
             "trajectory_duration_s": "一次模型输出的全部10个动作点的总执行时间；程序自动生成原AUBO move_to_point(t, pose)所需的累计到达时间t。",
             "control_timeout_s": "控制周期明显延迟的日志警告阈值；偶发超时只警告，不立即停止。",
             "servo_lookahead_s": "AUBO ServoJ平滑预测时间；增大更平滑但滞后更大，减小响应更快但可能抖动。",
             "servo_gain": "AUBO ServoJ目标跟踪增益；增大跟随更紧但可能增加抖动，通常保持参考值200。",
             "servo_queue_full_max_consecutive": "AUBO连续返回code 2队列满达到该次数后停止；偶发队列满只丢弃当前帧。",
-            "xjc_max_sample_age_s": "仅在未来启用force_position导纳/力位混合时使用的XJC实时样本新鲜度阈值；纯位置控制不以它停止Servo。",
+            "xjc_max_sample_age_s": "admithybrid接触段允许的XJC最新样本最大年龄；超过该值立即停止。纯位置段不以它停止Servo。",
             "workspace_bounds_aubo_base": "AUBO基座坐标系下TCP允许范围，依次为X、Y、Z的最小值和最大值。",
-            "trajectory_execution": "move_to_point：一次策略输出的10个TCP点先连续求解为10个关节路点；唯一Servo线程按control_rate_hz直接进行关节插值并发送。10点结束后才重新观测和推理下一块。"
+            "trajectory_execution": "move_to_point：position段先连续求解为关节路点并插值；admithybrid段在同一Servo线程内插值模型位姿/力，读取XJC并实时导纳修正。10点结束后才重新观测和推理下一块。"
         },
         "_参数关系": [
             "Servo周期=1/control_rate_hz；程序自动把servoJoint持续时间设为该周期，不再单独配置servo_duration_s。",
@@ -130,12 +152,12 @@
             "当前纯位置轨迹不再做每周期TCP速度/角速度裁剪；仍保留工作空间、IK、AUBO自身碰撞保护和急停。",
             "当前act_horizon为10、trajectory_duration_s为20秒：每轮完整执行10点后，才采集新观测并开始下一次推理；推理期间Servo线程保持最后成功关节位姿。",
             "启动每个动作块前连续求解10步名义IK；运行时每周期仅对相邻关节路点线性插值后发送ServoJ。",
-            "当前control_mode=position：无论模型预测力是否超过force_threshold，都不会进入软件导纳或力位混合控制。"
+            "默认control_mode=position，保持已验证的纯位置控制；完成XJC轴向和接触验证后，手动改为position_hybrid以启用预测力切换。"
         ],
-        "control_mode": "position",
+        "control_mode": "position_hybrid",
         "position_command": "send_command",
         "control_rate_hz": 100,
-        "trajectory_duration_s": 10,
+        "trajectory_duration_s": 8.0,
         "control_timeout_s": 0.1,
         "servo_lookahead_s": 0.05,
         "servo_gain": 200.0,

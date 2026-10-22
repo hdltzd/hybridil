@@ -3,15 +3,123 @@
 from collections import deque
 import json
 import math
+from pathlib import Path
 import threading
 import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
+from controllers.aubo_admit_hybrid import AuboDeploymentControllerManager
 from deployment.aubo_hybridil import transform_action_to_aubo_base
 from devices.aubo_c5 import AuboQueueFullError
 from devices.xjc_ft import XjcProtocolError
+
+
+class TelemetryRecorder:
+    """向浏览器监视器写入低频JSONL遥测；默认关闭。"""
+
+    def __init__(self, config=None):
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+        sample_rate_hz = float(config.get("sample_rate_hz", 10.0))
+        if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+            raise ValueError("telemetry.sample_rate_hz must be positive")
+        self.sample_period = 1.0 / sample_rate_hz
+        self.path = Path(config.get("path", "logs/aubo_telemetry.jsonl"))
+        self._lock = threading.Lock()
+        self._stream = None
+        self._next_sample = 0.0
+        if self.enabled:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            mode = "w" if bool(config.get("truncate_on_start", True)) else "a"
+            self._stream = self.path.open(mode, encoding="utf-8")
+
+    @staticmethod
+    def _json_value(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError("unsupported telemetry value: {}".format(type(value).__name__))
+
+    def should_sample(self):
+        if not self.enabled:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            if now < self._next_sample:
+                return False
+            self._next_sample = now + self.sample_period
+            return True
+
+    def record(self, event, **fields):
+        if not self.enabled or self._stream is None:
+            return
+        message = {"event": str(event), "timestamp_unix_s": time.time()}
+        message.update(fields)
+        try:
+            encoded = json.dumps(message, ensure_ascii=False, default=self._json_value)
+            with self._lock:
+                self._stream.write(encoded + "\n")
+                self._stream.flush()
+        except Exception as error:
+            # 可视化故障绝不影响实机控制。
+            print("遥测写入失败：{}".format(error))
+
+    def close(self):
+        with self._lock:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+
+
+class DashboardCommandMailbox:
+    """从本机浏览器仪表盘接收显式控制命令，不提供网络机器人SDK接口。"""
+
+    def __init__(self, config=None):
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+        self.path = Path(config.get("command_path", "logs/aubo_dashboard_commands.jsonl"))
+        self._lock = threading.Lock()
+        self._offset = 0
+        self._policy_call_limit = None
+        if self.enabled:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text("", encoding="utf-8")
+
+    @property
+    def policy_call_limit(self):
+        with self._lock:
+            return self._policy_call_limit
+
+    def poll(self):
+        if not self.enabled or not self.path.exists():
+            return []
+        with self._lock:
+            with self.path.open("r", encoding="utf-8") as stream:
+                stream.seek(self._offset)
+                lines = stream.readlines()
+                self._offset = stream.tell()
+        commands = []
+        for line in lines:
+            try:
+                command = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            name = command.get("command")
+            if name == "set_policy_calls":
+                try:
+                    value = int(command["value"])
+                    if value > 0:
+                        with self._lock:
+                            self._policy_call_limit = value
+                        commands.append(command)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            elif name in ("software_stop", "reset_init_pos"):
+                commands.append(command)
+        return commands
 
 
 class RuntimeStatistics:
@@ -311,12 +419,12 @@ def interpolate_wrench(start_wrench, end_wrench, alpha):
 
 
 class SingleServoControlLoop:
-    """纯位置部署的单线程关节轨迹 ServoJ 执行器。
+    """位置/接触混合部署的单线程 ServoJ 执行器。
 
     每轮模型输出的10个TCP位姿会在启动Servo前连续求解为10个关节路点。
-    本类的唯一实时线程只做关节插值和 ``servoJoint``：不在线求IK，也不
-    运行第二个轨迹发布线程。这样避免Python线程竞争或IK RPC偶发延迟打断
-    AUBO的Servo指令流。
+    非接触 ``position`` 段只做关节插值和 ``servoJoint``，不在线求IK。
+    接触 ``admithybrid`` 段由同一个线程读取最新XJC、执行导纳修正、实时
+    IK后发送ServoJ；不额外创建轨迹发布线程。
     """
 
     def __init__(
@@ -328,16 +436,25 @@ class SingleServoControlLoop:
         config,
         robot_lock,
         statistics,
+        telemetry=None,
+        command_mailbox=None,
+        reset_to_init_callback=None,
     ):
         self.robot = robot
         self.wrench_reader = wrench_reader
         self.controller = controller
+        self.controller_manager = AuboDeploymentControllerManager(controller)
         self.camera_to_aubo_base = np.asarray(camera_to_aubo_base, dtype=np.float64)
         self.robot_lock = robot_lock
         self.statistics = statistics
+        self.telemetry = telemetry
+        self.command_mailbox = command_mailbox
+        self.reset_to_init_callback = reset_to_init_callback
         self.control_mode = config.get("control_mode", "position")
-        if self.control_mode not in ("position", "force_position"):
-            raise ValueError("control_mode must be position or force_position")
+        if self.control_mode not in ("position", "position_hybrid"):
+            raise ValueError("control_mode must be position or position_hybrid")
+        if self.control_mode == "position_hybrid" and controller is None:
+            raise ValueError("position_hybrid mode requires an admithybrid controller")
         self.control_rate = float(config["control_rate_hz"])
         self.period = 1.0 / self.control_rate
         self.trajectory_duration = float(config["trajectory_duration_s"])
@@ -355,6 +472,7 @@ class SingleServoControlLoop:
         )
         self._condition = threading.Condition()
         self._joint_trajectory = None
+        self._hybrid_trajectory = None
         self._desired = None
         self._last_command = None
         self._last_joint_command = None
@@ -417,11 +535,9 @@ class SingleServoControlLoop:
         position, quat, wrench = transform_action_to_aubo_base(action, self.camera_to_aubo_base)
         if np.any(position < self.workspace[:, 0]) or np.any(position > self.workspace[:, 1]):
             raise RuntimeError("Predicted TCP target is outside the AUBO workspace")
-        if self.control_mode == "force_position" and self.controller is None:
-            raise RuntimeError("force_position mode requires an admittance controller")
         if mode == "hybrid":
             if self.controller is None:
-                raise RuntimeError("Hybrid mode requires an admittance controller")
+                raise RuntimeError("Hybrid mode requires an admithybrid controller")
             if np.linalg.norm(wrench[:3]) > self.controller.max_force:
                 raise RuntimeError("Predicted force exceeds the configured safety limit")
             if np.linalg.norm(wrench[3:]) > self.controller.max_torque:
@@ -439,23 +555,26 @@ class SingleServoControlLoop:
 
         return actions
 
-    def move_to_point(self, t, segments, joint_waypoints):
-        """提交一段完整的预求解关节轨迹。
+    def move_to_point(self, t, segments, joint_waypoints=None):
+        """提交一段 position 或 admithybrid 轨迹。
 
         参数 ``t`` 是与参考 ``MassageRobot.move_to_point`` 相同的累计到达
-        时间序列；``segments`` 仍保留原有的模型动作和模式检查。纯位置模式
-        下，``joint_waypoints`` 是与模型点一一对应的连续IK结果。
+        时间序列；每次提交只允许一种模式。``position`` 段必须传入与模型点
+        一一对应的 ``joint_waypoints``；``hybrid`` 段保留 TCP/力轨迹，在
+        Servo线程内按当前时间插值并实时导纳修正。
 
         本方法不会替换仍在执行的动作，也不会自行发起下一次推理。调用方必须
         使用 ``wait_executed_in_revision`` 等待本修订的全部点执行完成后，才
         采集新观测并提交下一块。这与原Flexiv的“完整动作块→新观测→新推理”
         逻辑一致。
         """
-        if self.control_mode != "position":
-            raise RuntimeError(
-                "force_position is not supported by the single-thread joint trajectory executor"
-            )
         items = self._validated_items(segments)
+        modes = {mode for mode, _ in items}
+        if len(modes) != 1:
+            raise ValueError("move_to_point accepts exactly one control mode per trajectory")
+        trajectory_mode = modes.pop()
+        if trajectory_mode == "hybrid" and self.control_mode != "position_hybrid":
+            raise RuntimeError("hybrid trajectory requires execution.control_mode=position_hybrid")
         time_points = np.asarray(t, dtype=np.float64).reshape(-1)
         if len(time_points) != len(items):
             raise ValueError("move_to_point time points must match action count")
@@ -463,30 +582,66 @@ class SingleServoControlLoop:
             raise ValueError("move_to_point time points must be positive and finite")
         if len(time_points) > 1 and np.any(np.diff(time_points) <= 0.0):
             raise ValueError("move_to_point time points must be strictly increasing")
-        joints = np.asarray(joint_waypoints, dtype=np.float64)
-        expected_shape = (len(items), len(self._last_joint_command))
-        if joints.shape != expected_shape or not np.isfinite(joints).all():
-            raise ValueError(
-                "joint_waypoints must have shape {} and contain finite values".format(
-                    expected_shape
-                )
+        hybrid_start = None
+        if trajectory_mode == "hybrid":
+            with self.robot_lock:
+                tcp = self.robot.get_tcp_pose(matrix=True)
+            hybrid_start = (
+                tcp[:3, 3].copy(),
+                Rot.from_matrix(tcp[:3, :3]).as_quat(),
             )
         with self._condition:
             self.raise_if_failed_locked()
-            if self._joint_trajectory is not None:
+            if self._joint_trajectory is not None or self._hybrid_trajectory is not None:
                 raise RuntimeError("AUBO move_to_point trajectory is already running")
             self._revision += 1
             revision = self._revision
             self._active_revision = revision
             self._executed_in_revision = 0
             self._accepted_actions += len(items)
-            self._joint_trajectory = (
-                revision,
-                time.monotonic(),
-                time_points.copy(),
-                self._last_joint_command.copy(),
-                joints.copy(),
-            )
+            started = time.monotonic()
+            if trajectory_mode == "position":
+                joints = np.asarray(joint_waypoints, dtype=np.float64)
+                expected_shape = (len(items), len(self._last_joint_command))
+                if joints.shape != expected_shape or not np.isfinite(joints).all():
+                    raise ValueError(
+                        "joint_waypoints must have shape {} and contain finite values".format(
+                            expected_shape
+                        )
+                    )
+                self.controller_manager.switch_controller("position")
+                self._joint_trajectory = (
+                    revision,
+                    started,
+                    time_points.copy(),
+                    self._last_joint_command.copy(),
+                    joints.copy(),
+                )
+            else:
+                targets = []
+                for _, action in items:
+                    position, quat, wrench = transform_action_to_aubo_base(
+                        action,
+                        self.camera_to_aubo_base,
+                    )
+                    targets.append((position, quat, wrench))
+                start_position, start_quat = hybrid_start
+                self.controller_manager.switch_controller("admithybrid")
+                self._hybrid_trajectory = (
+                    revision,
+                    started,
+                    time_points.copy(),
+                    np.asarray(start_position, dtype=np.float64).copy(),
+                    np.asarray(start_quat, dtype=np.float64).copy(),
+                    tuple(
+                        (
+                            position.copy(),
+                            quat.copy(),
+                            wrench.copy(),
+                        )
+                        for position, quat, wrench in targets
+                    ),
+                )
             self._condition.notify_all()
             return revision
 
@@ -552,28 +707,55 @@ class SingleServoControlLoop:
         target_quat,
         target_wrench,
     ):
-        """计算一个Servo目标；纯位置模式直接使用轨迹发布的期望位姿。"""
-        compliant = self.control_mode == "force_position"
-        if not compliant:
-            return np.asarray(target_position, dtype=np.float64), np.asarray(target_quat, dtype=np.float64)
+        """使用当前选中的 admithybrid 控制器计算接触段TCP命令。"""
         if self.wrench_reader is None or self.controller is None:
-            raise RuntimeError("Compliant position control requires XJC and a controller")
+            raise RuntimeError("admithybrid control requires XJC and a controller")
         measured = self.controller.validate_measured_wrench(
             self.wrench_reader(current_quat)
         )
-        desired_wrench = (
-            target_wrench if mode == "hybrid" else np.zeros(6, dtype=np.float64)
-        )
-        return self.controller.step(
+        return self.controller_manager.step(
             current_position_base=current[:3, 3],
             current_quat_xyzw_base=current_quat,
             target_position_base=target_position,
             target_quat_xyzw_base=target_quat,
             measured_wrench_tcp=measured,
-            desired_wrench_tcp=desired_wrench,
+            desired_wrench_tcp=target_wrench,
             dt=self.period,
-            limit_profile="hybrid" if mode == "hybrid" else "position",
         )
+
+    def _record_actual_sample(
+        self,
+        mode,
+        target_position=None,
+        target_quat=None,
+        target_wrench=None,
+        command_position=None,
+        command_quat=None,
+    ):
+        """低频记录真实TCP和XJC，供浏览器显示，不参与控制决策。"""
+        if self.telemetry is None or not self.telemetry.should_sample():
+            return
+        try:
+            with self.robot_lock:
+                actual = self.robot.get_tcp_pose(matrix=True)
+            actual_quat = Rot.from_matrix(actual[:3, :3]).as_quat()
+            measured_wrench = self.wrench_reader(actual_quat)
+            self.telemetry.record(
+                "control_sample",
+                mode=mode,
+                revision=self._active_revision,
+                actual_tcp_xyz_aubo_base=actual[:3, 3],
+                actual_tcp_quat_xyzw_aubo_base=actual_quat,
+                measured_wrench_tcp=measured_wrench,
+                target_tcp_xyz_aubo_base=target_position,
+                target_tcp_quat_xyzw_aubo_base=target_quat,
+                target_wrench_tcp=target_wrench,
+                command_tcp_xyz_aubo_base=command_position,
+                command_tcp_quat_xyzw_aubo_base=command_quat,
+            )
+        except Exception as error:
+            # 遥测读取失败不得把一个额外监视功能变成停机原因。
+            self.telemetry.record("telemetry_sample_error", error=str(error))
 
     def _desired_target(self):
         with self._condition:
@@ -615,6 +797,53 @@ class SingleServoControlLoop:
             if completed == len(times):
                 self._joint_trajectory = None
             return np.asarray(target, dtype=np.float64).copy(), "position"
+
+    def _next_hybrid_target(self):
+        """插值接触段的模型目标TCP位姿和目标六维力。"""
+        with self._condition:
+            if self._hybrid_trajectory is None:
+                return None
+            revision, started, times, start_position, start_quat, targets = (
+                self._hybrid_trajectory
+            )
+            elapsed = max(0.0, time.monotonic() - started)
+            index = int(np.searchsorted(times, elapsed, side="left"))
+            if index >= len(times):
+                position, quat, wrench = targets[-1]
+                completed = len(times)
+            else:
+                previous_time = 0.0 if index == 0 else float(times[index - 1])
+                if index == 0:
+                    previous_position = start_position
+                    previous_quat = start_quat
+                    previous_wrench = np.zeros(6, dtype=np.float64)
+                else:
+                    previous_position, previous_quat, previous_wrench = targets[index - 1]
+                endpoint = float(times[index])
+                alpha = (elapsed - previous_time) / max(endpoint - previous_time, 1e-12)
+                position, quat = interpolate_pose(
+                    previous_position,
+                    previous_quat,
+                    targets[index][0],
+                    targets[index][1],
+                    alpha,
+                )
+                wrench = interpolate_wrench(previous_wrench, targets[index][2], alpha)
+                completed = int(np.count_nonzero(times <= elapsed + 1e-9))
+
+            if completed > self._executed_in_revision:
+                increment = completed - self._executed_in_revision
+                self._executed_actions += increment
+                self._executed_in_revision = completed
+                self._condition.notify_all()
+            if completed == len(times):
+                self._hybrid_trajectory = None
+            return (
+                np.asarray(position, dtype=np.float64).copy(),
+                np.asarray(quat, dtype=np.float64).copy(),
+                np.asarray(wrench, dtype=np.float64).copy(),
+                "hybrid",
+            )
 
     def _capture_failure_snapshot(
         self,
@@ -674,10 +903,39 @@ class SingleServoControlLoop:
         print("AUBO失败瞬间状态（stop前）：")
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
 
+    def _process_dashboard_commands(self):
+        """在唯一Servo线程中处理本机网页命令。"""
+        if self.command_mailbox is None:
+            return
+        for command in self.command_mailbox.poll():
+            name = command.get("command")
+            if name == "set_policy_calls":
+                print("浏览器已设置本次部署最大推理次数：{}".format(command["value"]))
+                if self.telemetry is not None:
+                    self.telemetry.record("dashboard_command", command=command)
+            elif name == "software_stop":
+                if self.telemetry is not None:
+                    self.telemetry.record("dashboard_command", command=command)
+                raise RuntimeError("Browser requested software stop; use physical E-stop for emergencies")
+            elif name == "reset_init_pos":
+                if self.reset_to_init_callback is None:
+                    raise RuntimeError("Browser reset requested but no init_pos callback is configured")
+                print("浏览器请求复位：停止当前轨迹并低速返回 init_pos")
+                with self._condition:
+                    self._joint_trajectory = None
+                    self._hybrid_trajectory = None
+                # stop() 会退出Servo模式，随后回调使用已配置的保守MoveJ路点。
+                with self.robot_lock:
+                    self.robot.stop()
+                self.reset_to_init_callback()
+                if self.telemetry is not None:
+                    self.telemetry.record("dashboard_reset_completed", command=command)
+                # 复位完成后结束本次部署，避免旧模型轨迹在init_pos继续执行。
+                raise RuntimeError("Browser reset to init_pos completed; deployment stopped")
+
     def _run(self):
         previous_start = None
         overrun_count = 0
-        current_mode = None
         while True:
             with self._condition:
                 if self._closed:
@@ -690,6 +948,7 @@ class SingleServoControlLoop:
             joint_command = None
             mode = None
             try:
+                self._process_dashboard_commands()
                 if previous_start is not None and cycle_start - previous_start > self.timeout:
                     overrun_count += 1
                     if overrun_count == 1 or overrun_count % 100 == 0:
@@ -700,16 +959,13 @@ class SingleServoControlLoop:
                             )
                         )
                 previous_start = cycle_start
-                if self.control_mode == "position":
+                hybrid_target = self._next_hybrid_target()
+                if hybrid_target is None:
                     joint_command, mode = self._next_joint_target()
                     target_wrench = np.zeros(6, dtype=np.float64)
                 else:
-                    mode, target_position, target_quat, target_wrench = self._desired_target()
-                compliant = self.control_mode == "force_position"
-                if compliant and current_mode != (self.control_mode, mode):
-                    self.controller.reset()
-                current_mode = (self.control_mode, mode)
-                if compliant:
+                    target_position, target_quat, target_wrench, mode = hybrid_target
+                if mode == "hybrid":
                     with self.robot_lock:
                         current = self.robot.get_tcp_pose(matrix=True)
                     current_quat = Rot.from_matrix(current[:3, :3]).as_quat()
@@ -752,10 +1008,19 @@ class SingleServoControlLoop:
                     ).copy()
                 if accepted:
                     with self._condition:
-                        self._last_command = (
-                            np.asarray(command_position, dtype=np.float64).copy(),
-                            np.asarray(command_quat, dtype=np.float64).copy(),
-                        )
+                        if command_position is not None:
+                            self._last_command = (
+                                np.asarray(command_position, dtype=np.float64).copy(),
+                                np.asarray(command_quat, dtype=np.float64).copy(),
+                            )
+                self._record_actual_sample(
+                    mode=mode,
+                    target_position=target_position,
+                    target_quat=target_quat,
+                    target_wrench=target_wrench,
+                    command_position=command_position,
+                    command_quat=command_quat,
+                )
                 self.statistics.record_cycle(time.monotonic() - cycle_start)
             except Exception as error:
                 self._capture_failure_snapshot(

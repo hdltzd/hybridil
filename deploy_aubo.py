@@ -35,9 +35,11 @@ from deployment.aubo_hybridil import (
     validate_transform,
 )
 from deployment.aubo_runtime import (
+    DashboardCommandMailbox,
     LatestWrenchCache,
     RuntimeStatistics,
     SingleServoControlLoop,
+    TelemetryRecorder,
 )
 
 
@@ -696,7 +698,8 @@ def build_control_hardware(config: Dict, statistics, robot_lock=None):
             wrench_cache.close()
         if sensor is not None:
             sensor.close()
-        robot.close()
+        if robot is not None:
+            robot.close()
         raise
 
 
@@ -742,7 +745,10 @@ def build_live_hardware(
             sensor.close()
         if camera is not None:
             camera.close()
-        robot.close()
+        # build_control_hardware 可能在返回 robot 前失败；此处不能让清理异常
+        # 覆盖最初的 XJC 连接错误。
+        if robot is not None:
+            robot.close()
         raise
 
 
@@ -774,10 +780,14 @@ def validate_deployment_config(config, args):
         raise RuntimeError("--prepare requires --execute because it moves the AUBO")
 
     execution = config["execution"]
-    if execution.get("control_mode") != "position":
+    if execution.get("control_mode") not in ("position", "position_hybrid"):
         raise ValueError(
-            "当前单线程关节轨迹执行器仅支持 execution.control_mode=position"
+            "execution.control_mode must be position or position_hybrid"
         )
+    if execution.get("control_mode") == "position_hybrid" and not isinstance(
+        config.get("controller_config"), str
+    ):
+        raise ValueError("position_hybrid模式必须配置controller_config")
     position_command = execution.get("position_command", "servo_joint")
     if position_command != "send_command":
         raise ValueError("当前位置控制必须使用 execution.position_command=send_command")
@@ -1069,11 +1079,38 @@ def main() -> None:
         )
 
     statistics = RuntimeStatistics()
+    telemetry = TelemetryRecorder(config.get("telemetry"))
+    command_mailbox = DashboardCommandMailbox(config.get("browser_control"))
     inference = None
     controller = None
     robot = camera = sensor = wrench_cache = live_source = replay_source = None
     servo_control = None
     robot_lock = threading.RLock()
+
+    def reset_to_init_pos():
+        """网页复位回调：只走已配置的低速 init_pos 路点。"""
+        preparation = config["preparation"]
+        waypoints = preparation.get("init_joint_waypoints_rad")
+        if not isinstance(waypoints, list) or not waypoints:
+            raise RuntimeError("Browser reset requires preparation.init_joint_waypoints_rad")
+        max_velocity = float(preparation["movej_max_velocity_rad_s"])
+        max_acceleration = float(preparation["movej_max_acceleration_rad_s2"])
+        timeout_s = float(preparation["movej_timeout_s"])
+        tolerance = float(preparation["movej_tolerance_rad"])
+        for index, waypoint in enumerate(waypoints):
+            target = np.asarray(waypoint, dtype=np.float64)
+            if target.shape != (6,) or not np.isfinite(target).all():
+                raise RuntimeError("Invalid init_pos waypoint {}".format(index))
+            with robot_lock:
+                robot.move_joints(
+                    target,
+                    max_velocity=max_velocity,
+                    max_acceleration=max_acceleration,
+                    wait=True,
+                    timeout_s=timeout_s,
+                    tolerance_rad=tolerance,
+                )
+            print("浏览器复位：init_pos 路点 {}/{} 已到达".format(index + 1, len(waypoints)))
 
     def create_inference_client():
         inference_config = config["inference"]
@@ -1103,8 +1140,10 @@ def main() -> None:
         return predict_with_client(inference, observation)
 
     try:
-        # 当前部署仅采用与原Flexiv非接触阶段一致的纯位置路径：
-        # 模型TCP位姿 -> 启动Servo前连续IK -> 关节插值 -> AUBO ServoJ。
+        # 非接触段采用已验证的关节轨迹位置控制；position_hybrid模式会在
+        # 预测力满足阈值时切换到 admithybrid 软件导纳控制器。
+        if args.execute and execution["control_mode"] == "position_hybrid":
+            controller = make_controller(config["controller_config"])
 
         # 保持模式和HDF5动作回放不需要连接模型服务器。
         if not args.recorded_actions and not hold_seconds:
@@ -1158,6 +1197,9 @@ def main() -> None:
                 config=execution,
                 robot_lock=robot_lock,
                 statistics=statistics,
+                telemetry=telemetry,
+                command_mailbox=command_mailbox,
+                reset_to_init_callback=reset_to_init_pos,
             )
             servo_control.start()
             print("当前位置保持测试开始：{:.3f}秒".format(hold_seconds))
@@ -1194,28 +1236,17 @@ def main() -> None:
                 completed += 1
             return
 
-        if execution["control_mode"] == "position":
+        if execution["control_mode"] in ("position", "position_hybrid"):
             observation = get_live_observation()
             actions, inference_latency = predict(observation)
             workspace = np.asarray(
                 execution["workspace_bounds_aubo_base"],
                 dtype=np.float64,
             )
-            # 启动Servo前连续求解完整10步IK。纯位置实时线程只插值这些
-            # 关节路点并发送ServoJ，绝不在每个控制周期重新调用IK RPC。
-            with robot_lock:
-                nominal_joints, _ = solve_continuous_joint_targets(
-                    robot,
-                    actions,
-                    camera_to_aubo_base,
-                    workspace,
-                )
-
             planner = ActionChunkPlanner(
                 force_threshold=float(policy_config["force_threshold"]),
                 force_ratio=float(policy_config["force_ratio"]),
-                # 当前纯位置部署不让预测力改变执行方式。
-                hybrid_force_enabled=False,
+                hybrid_force_enabled=execution["control_mode"] == "position_hybrid",
             )
             servo_control = SingleServoControlLoop(
                 robot=robot,
@@ -1225,6 +1256,9 @@ def main() -> None:
                 config=execution,
                 robot_lock=robot_lock,
                 statistics=statistics,
+                telemetry=telemetry,
+                command_mailbox=command_mailbox,
+                reset_to_init_callback=reset_to_init_pos,
             )
             robot.require_motion_allowed()
             robot.enable_servo()
@@ -1234,31 +1268,99 @@ def main() -> None:
             accepted = 1
             current_latency = inference_latency
             current_source_index = 0
-            timeout_s = max(
-                5.0,
-                float(execution["trajectory_duration_s"]) + 2.0,
-            )
-            revision = servo_control.move_to_point(
-                move_to_point_times(execution["trajectory_duration_s"], len(actions)),
-                plan_segments(planner, actions),
-                joint_waypoints=nominal_joints,
-            )
+            def execute_policy_block(block_actions):
+                """按模型预测力将一个动作块依次执行为位置/接触段。"""
+                chunks = plan_segments(planner, block_actions)
+                if telemetry.enabled:
+                    for step, action in enumerate(np.asarray(block_actions, dtype=np.float64)):
+                        xyz, quat, wrench = transform_action_to_aubo_base(
+                            action,
+                            camera_to_aubo_base,
+                        )
+                        telemetry.record(
+                            "raw_prediction",
+                            policy_call=accepted - 1,
+                            step=step,
+                            tcp_xyz_aubo_base=xyz,
+                            tcp_quat_xyzw_aubo_base=quat,
+                            predicted_wrench_tcp=wrench,
+                        )
+                nominal_ik_count = 0
+                execution_modes = []
+                action_count = len(block_actions)
+                # plan_segments 返回 (mode, actions) 元组，而非 PlannedChunk 对象。
+                # 在此立即解包，避免位置段和接触段走到不同接口时出现属性错误。
+                for chunk_mode, chunk_actions in chunks:
+                    chunk_actions = np.asarray(chunk_actions, dtype=np.float64)
+                    chunk_duration = (
+                        float(execution["trajectory_duration_s"])
+                        * len(chunk_actions)
+                        / action_count
+                    )
+                    time_points = move_to_point_times(chunk_duration, len(chunk_actions))
+                    if telemetry.enabled:
+                        start_unix_s = time.time()
+                        for step, (arrival_s, action) in enumerate(zip(time_points, chunk_actions)):
+                            xyz, quat, wrench = transform_action_to_aubo_base(
+                                action,
+                                camera_to_aubo_base,
+                            )
+                            telemetry.record(
+                                "planned_action",
+                                policy_call=accepted - 1,
+                                step=step,
+                                mode=chunk_mode,
+                                scheduled_timestamp_unix_s=start_unix_s + float(arrival_s),
+                                tcp_xyz_aubo_base=xyz,
+                                tcp_quat_xyzw_aubo_base=quat,
+                                predicted_wrench_tcp=wrench,
+                            )
+                    if chunk_mode == "position":
+                        # 仅非接触段预求解IK；接触导纳段必须用实测力实时修正。
+                        with robot_lock:
+                            joints, _ = solve_continuous_joint_targets(
+                                robot,
+                                chunk_actions,
+                                camera_to_aubo_base,
+                                workspace,
+                            )
+                        revision = servo_control.move_to_point(
+                            time_points,
+                            [("position", chunk_actions)],
+                            joint_waypoints=joints,
+                        )
+                        nominal_ik_count += len(joints)
+                        execution_modes.append("position")
+                    elif chunk_mode == "hybrid":
+                        revision = servo_control.move_to_point(
+                            time_points,
+                            [("hybrid", chunk_actions)],
+                        )
+                        execution_modes.append("admithybrid")
+                    else:
+                        raise RuntimeError("Unknown planned control mode: {}".format(chunk_mode))
+
+                    chunk_timeout = max(5.0, chunk_duration + 2.0)
+                    if not servo_control.wait_executed_in_revision(
+                        len(chunk_actions), timeout=chunk_timeout, revision=revision
+                    ):
+                        raise RuntimeError("Timed out waiting for move_to_point trajectory")
+                    servo_control.raise_if_failed()
+                return execution_modes, nominal_ik_count
+
+            execution_modes, nominal_ik_count = execute_policy_block(actions)
             while True:
-                # 按参考move_to_point语义：当前模型完整动作块执行完毕，
-                # 才采集新观测并请求下一次模型推理。
-                if not servo_control.wait_executed_in_revision(
-                    len(actions), timeout=timeout_s, revision=revision
-                ):
-                    raise RuntimeError("Timed out waiting for the complete move_to_point trajectory")
-                servo_control.raise_if_failed()
+                browser_limit = command_mailbox.policy_call_limit
+                if browser_limit is not None:
+                    max_calls = browser_limit
                 with robot_lock:
                     current_tcp = robot.get_tcp_pose(matrix=True)[:3, 3]
                 print(json.dumps({
                     "policy_call": accepted - 1,
                     "source_index": current_source_index,
-                    "execution_mode": "move_to_point_joint_position",
+                    "execution_modes": execution_modes,
                     "action_count": len(actions),
-                    "nominal_ik_count": len(nominal_joints),
+                    "nominal_ik_count": nominal_ik_count,
                     "inference_latency_s": round(float(current_latency), 6),
                     "executed_actions": servo_control.executed_actions,
                     "tcp_position_aubo_base": np.round(current_tcp, 6).tolist(),
@@ -1268,23 +1370,11 @@ def main() -> None:
                 if accepted >= max_calls:
                     break
 
-                # 当前10点完成后才开始下一轮：重新采集D455/AUBO/XJC观测，
-                # 再推理、预求解完整10步IK、提交下一段move_to_point轨迹。
+                # 当前完整动作块结束后才开始下一轮观测和推理。
                 observation = get_live_observation()
                 actions, current_latency = predict(observation)
-                with robot_lock:
-                    nominal_joints, _ = solve_continuous_joint_targets(
-                        robot,
-                        actions,
-                        camera_to_aubo_base,
-                        workspace,
-                    )
                 servo_control.raise_if_failed()
-                revision = servo_control.move_to_point(
-                    move_to_point_times(execution["trajectory_duration_s"], len(actions)),
-                    plan_segments(planner, actions),
-                    joint_waypoints=nominal_joints,
-                )
+                execution_modes, nominal_ik_count = execute_policy_block(actions)
                 current_source_index = accepted
                 accepted += 1
 
@@ -1310,6 +1400,7 @@ def main() -> None:
             camera.close()
         if robot is not None:
             robot.close()
+        telemetry.close()
         if args.execute:
             print(json.dumps({"final_statistics": statistics.snapshot()}, indent=2, ensure_ascii=False))
 
